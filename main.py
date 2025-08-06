@@ -1,4 +1,3 @@
-# main.py
 import pyupbit
 import time
 import threading
@@ -134,3 +133,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_bot, daemon=True).start()
     # Flask는 Render에서 keep-alive 유지용
     app.run(host="0.0.0.0", port=10000)
+
