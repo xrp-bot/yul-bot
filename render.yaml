@@ -1,9 +1,7 @@
-services:
-  - type: web
-    name: yul-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python3 main.py
-    plan: free
-    region: singapore
+type: web
+name: yul-bot
+env: python
+build:
+  environment:
     pythonVersion: 3.12.3
+startCommand: "python3 main.py"
