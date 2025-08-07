@@ -1,4 +1,4 @@
-# main.py (KRW 잔액 조회 완전 제거)
+# main.py (KRW/XRP 잔액 조회 완전 삭제, 무조건 주문 시도)
 import os
 import time
 import requests
@@ -68,9 +68,8 @@ def run_bot():
                 last_report_date = now.date()
 
             if not bought:
-                # KRW 잔액 조회 없이 바로 전체 금액으로 매수 시도
                 try:
-                    upbit.buy_market_order(symbol, 0)  # 0 입력시 전체 사용 (pyupbit 특성)
+                    upbit.buy_market_order(symbol, 0)
                     buy_price = price
                     bought = True
                     send_telegram_message(f"📥 매수 진입: {buy_price:.2f}원")
@@ -79,16 +78,12 @@ def run_bot():
                     time.sleep(60)
                     continue
             else:
-                xrp_balance = upbit.get_balance("XRP")
-                if xrp_balance is None:
-                    send_telegram_message("❗ XRP 잔액 조회 실패 (None)")
-                    time.sleep(10)
-                    continue
-                if xrp_balance == 0:
-                    send_telegram_message("❗ XRP 잔액이 0입니다.")
-                    bought = False
-                    buy_price = None
-                    time.sleep(10)
+                try:
+                    # XRP 잔액 확인 없이 바로 전체 시장가 매도 시도
+                    upbit.sell_market_order(symbol, 0)
+                except Exception as sell_err:
+                    send_telegram_message(f"❗️매도 주문 실패: {sell_err}")
+                    time.sleep(60)
                     continue
 
                 if buy_price is None:
@@ -96,24 +91,21 @@ def run_bot():
                     time.sleep(10)
                     continue
 
+                profit_percent = ((price - buy_price) / buy_price) * 100
                 target_profit = buy_price * (1 + profit_ratio)
                 target_loss = buy_price * (1 - loss_ratio)
 
                 if price >= target_profit:
-                    upbit.sell_market_order(symbol, xrp_balance)
-                    profit = ((price - buy_price) / buy_price) * 100
                     success_count += 1
-                    total_profit_percent += profit
-                    send_telegram_message(f"🎯 익절 완료: {price:.2f}원 (+{profit:.2f}%)")
+                    total_profit_percent += profit_percent
+                    send_telegram_message(f"🎯 익절 완료: {price:.2f}원 (+{profit_percent:.2f}%)")
                     bought = False
                     buy_price = None
 
                 elif price <= target_loss:
-                    upbit.sell_market_order(symbol, xrp_balance)
-                    loss = ((price - buy_price) / buy_price) * 100
                     fail_count += 1
-                    total_profit_percent += loss
-                    send_telegram_message(f"💥 손절 처리: {price:.2f}원 ({loss:.2f}%)")
+                    total_profit_percent += profit_percent
+                    send_telegram_message(f"💥 손절 처리: {price:.2f}원 ({profit_percent:.2f}%)")
                     bought = False
                     buy_price = None
 
