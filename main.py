@@ -1,4 +1,4 @@
-# main.py (수정된 포트 바인딩 포함)
+O# main.py (환경변수 방식, Render Web Service 대응)
 import os
 import time
 import requests
@@ -13,11 +13,11 @@ app = Flask(__name__)
 def index():
     return "✅ Yul Bot is running on Render (Web Service)"
 
-# ✅ 환경 변수
-ACCESS_KEY = os.getenv("lOmAytTKb4QJpEsWpDWyOcBHtyAfEod2vxjgesBF")
-SECRET_KEY = os.getenv("VtAJf1FZfiH2kmV1AdKFoaaePaH1xqeTFzxDw45O")
-TELEGRAM_TOKEN = os.getenv("8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc")
-TELEGRAM_CHAT_ID = os.getenv("1054008930")
+# ✅ 환경변수에서 키값 불러오기
+ACCESS_KEY = os.getenv("ACCESS_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 symbol = "KRW-XRP"
 profit_ratio = 0.03
@@ -99,6 +99,6 @@ def run_bot():
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot).start()
-    port = int(os.environ.get("PORT", 5000))  # ✅ Render가 요구하는 포트 사용
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
