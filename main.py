@@ -1,30 +1,26 @@
 import pyupbit
 import time
-import threading
 import asyncio
 from datetime import datetime
 from telegram import Bot
-from flask import Flask
 import os
 import csv
 
-# 🔐 직접 입력
-ACCESS_KEY = "lOmAytTKb4QJpEsWpDWyOcBHtyAfEod2vxjgesBF"
-SECRET_KEY = "VtAJf1FZfiH2kmV1AdKFoaaePaH1xqeTFzxDw45O"
-TELEGRAM_TOKEN = "8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc"
-TELEGRAM_CHAT_ID = "1054008930"
+# 📌 환경 변수로부터 정보 불러오기 (Render에서 설정 필요)
+ACCESS_KEY = os.getenv("lOmAytTKb4QJpEsWpDWyOcBHtyAfEod2vxjgesBF")
+SECRET_KEY = os.getenv("VtAJf1FZfiH2kmV1AdKFoaaePaH1xqeTFzxDw45O")
+TELEGRAM_TOKEN = os.getenv("8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc")
+TELEGRAM_CHAT_ID = os.getenv("1054008930")
 
 symbol = "KRW-XRP"
 profit_ratio = 0.03
 loss_ratio = 0.01
-
 csv_file = "trades.csv"
+
 success_count = 0
 fail_count = 0
 total_profit_percent = 0
 last_report_date = None
-bought = False
-buy_price = 0
 
 # ✅ 텔레그램 알림
 async def send_telegram_message_async(msg):
@@ -71,33 +67,34 @@ def send_summary():
     )
     send_telegram_message(msg)
 
-# ✅ 자동매매
+# ✅ 자동매매 루프
 def run_bot():
-    global last_report_date, bought, buy_price
+    global last_report_date
 
     upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
-    send_telegram_message("🚀 XRP 자동매매 봇 시작됨")
+    send_telegram_message("🚀 [Render] XRP 자동매매 봇 시작됨")
+    bought = False
+    buy_price = 0
 
     while True:
         try:
             now = datetime.now()
             price = pyupbit.get_current_price(symbol)
 
-            # 수익 요약 (오전 9시 1회)
             if last_report_date != now.date() and now.hour == 9:
                 send_summary()
                 last_report_date = now.date()
 
             if not bought:
                 krw_balance = upbit.get_balance("KRW")
-                if krw_balance > 5000:
-                    buy_amount = krw_balance * 0.9995
-                    upbit.buy_market_order(symbol, buy_amount)
-                    buy_price = price
-                    bought = True
+                buy_amount = krw_balance * 0.9995
+                upbit.buy_market_order(symbol, buy_amount)
+                buy_price = price
+                bought = True
 
-                    xrp_balance = upbit.get_balance("XRP")
-                    send_telegram_message(f"📥 매수 진입! 가격: {buy_price:.2f}\nXRP: {xrp_balance:.4f}")
+                xrp_balance = upbit.get_balance("XRP")
+                send_telegram_message(f"📥 매수 진입! 가격: {buy_price:.2f}\nXRP: {xrp_balance:.4f}")
+
             else:
                 balance = upbit.get_balance("XRP")
                 target_profit = buy_price * (1 + profit_ratio)
@@ -120,17 +117,7 @@ def run_bot():
 
         time.sleep(10)
 
-# ✅ Flask 웹서버 → Render 자동 슬립 방지
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ XRP 자동매매 봇이 작동 중입니다."
-
 # ✅ 실행
 if __name__ == "__main__":
-    # 봇은 백그라운드에서 실행
-    threading.Thread(target=run_bot, daemon=True).start()
-    # Flask는 Render에서 keep-alive 유지용
-    app.run(host="0.0.0.0", port=10000)
+    run_bot()
 

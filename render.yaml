@@ -1,7 +1,7 @@
-type: web
-name: yul-bot
-env: python
-build:
-  environment:
-    pythonVersion: 3.12.3
-startCommand: "python3 main.py"
+services:
+  - type: web
+    name: yul-bot
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+
