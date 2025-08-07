@@ -1,4 +1,3 @@
-# main.py (KRW/XRP 잔액 조회 완전 삭제, 무조건 주문 시도)
 import os
 import time
 import requests
@@ -69,17 +68,22 @@ def run_bot():
 
             if not bought:
                 try:
-                    upbit.buy_market_order(symbol, 0)
-                    buy_price = price
-                    bought = True
-                    send_telegram_message(f"📥 매수 진입: {buy_price:.2f}원")
+                    krw = upbit.get_balance("KRW")
+                    if krw is not None and krw > 5000:
+                        upbit.buy_market_order(symbol, krw * 0.9995)
+                        buy_price = price
+                        bought = True
+                        send_telegram_message(f"📥 매수 진입: {buy_price:.2f}원")
+                    else:
+                        send_telegram_message(f"❗️KRW 잔액 부족: {krw}")
+                        time.sleep(60)
+                        continue
                 except Exception as buy_err:
                     send_telegram_message(f"❗️매수 주문 실패: {buy_err}")
                     time.sleep(60)
                     continue
             else:
                 try:
-                    # XRP 잔액 확인 없이 바로 전체 시장가 매도 시도
                     upbit.sell_market_order(symbol, 0)
                 except Exception as sell_err:
                     send_telegram_message(f"❗️매도 주문 실패: {sell_err}")
