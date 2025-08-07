@@ -3,15 +3,18 @@ import time
 import requests
 import pyupbit
 import threading
+import asyncio
 from datetime import datetime
 from flask import Flask
 
+# Flask 웹 서버
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "✅ Yul Bot is running on Render (Web Service)"
+    return "✅ Yul Bot is running (Web Service)"
 
+# 🔐 환경변수 기반 입력 (실전 배포 대응)
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -20,23 +23,53 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 symbol = "KRW-XRP"
 profit_ratio = 0.03
 loss_ratio = 0.01
-bought = False
-buy_price = None
+csv_file = "trades.csv"
+
+success_count = 0
+fail_count = 0
+total_profit_percent = 0
 last_report_date = None
 
-def send_telegram_message(message):
+# ✅ 텔레그램 알림
+async def send_telegram_message_async(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
         requests.post(url, data=payload)
     except Exception as e:
-        print("🚨 텔레그램 전송 오류:", e)
+        print(f"[텔레그램 전송 실패] {e}")
 
-def daily_report(success_count, fail_count, total_profit_percent):
+def send_telegram_message(msg):
+    asyncio.run(send_telegram_message_async(msg))
+
+# ✅ 거래 기록 저장
+def save_trade(buy_price, sell_price, amount, result, timestamp):
+    global total_profit_percent, success_count, fail_count
+    profit_percent = ((sell_price - buy_price) / buy_price) * 100
+    total_profit_percent += profit_percent
+
+    if result == "익절":
+        success_count += 1
+    elif result == "손절":
+        fail_count += 1
+
+    file_exists = os.path.isfile(csv_file)
+    with open(csv_file, mode='a', newline='') as file:
+        import csv
+        writer = csv.writer(file)
+        if not file_exists:
+            writer.writerow(["시간", "매수가", "매도가", "보유량", "결과", "수익률"])
+        writer.writerow([timestamp, buy_price, sell_price, amount, result, f"{profit_percent:.2f}%"])
+
+# ✅ 전략 요약
+def send_summary():
     total = success_count + fail_count
-    rate = (success_count / total) * 100 if total > 0 else 0
+    if total == 0:
+        rate = 0
+    else:
+        rate = (success_count / total) * 100
     msg = (
-        f"📊 자동매매 리포트\n"
+        f"📊 자동매매 전략 요약\n"
         f"✅ 익절 횟수: {success_count}\n"
         f"❌ 손절 횟수: {fail_count}\n"
         f"📈 누적 수익률: {total_profit_percent:.2f}%\n"
@@ -44,82 +77,63 @@ def daily_report(success_count, fail_count, total_profit_percent):
     )
     send_telegram_message(msg)
 
+# ✅ 자동매매
 def run_bot():
-    global bought, buy_price, last_report_date
-    success_count = 0
-    fail_count = 0
-    total_profit_percent = 0
+    global last_report_date
 
     upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
-    send_telegram_message("🤖 자동매매 봇 실행됨 (Render Web Service)")
+    send_telegram_message("🚀 XRP 자동매매 봇 시작됨 (Web Service)")
+    bought = False
+    buy_price = 0
 
     while True:
         try:
             now = datetime.now()
             price = pyupbit.get_current_price(symbol)
 
-            if price is None:
-                time.sleep(10)
-                continue
-
+            # 하루 1회 수익 리포트 (오전 9시)
             if last_report_date != now.date() and now.hour == 9:
-                daily_report(success_count, fail_count, total_profit_percent)
+                send_summary()
                 last_report_date = now.date()
 
             if not bought:
-                try:
-                    krw = upbit.get_balance("KRW")
-                    if krw is not None and krw > 5000:
-                        upbit.buy_market_order(symbol, krw * 0.9995)
-                        buy_price = price
-                        bought = True
-                        send_telegram_message(f"📥 매수 진입: {buy_price:.2f}원")
-                    else:
-                        send_telegram_message(f"❗️KRW 잔액 부족: {krw}")
-                        time.sleep(60)
-                        continue
-                except Exception as buy_err:
-                    send_telegram_message(f"❗️매수 주문 실패: {buy_err}")
+                krw_balance = upbit.get_balance("KRW")
+                if krw_balance is not None and krw_balance > 5000:
+                    buy_amount = krw_balance * 0.9995
+                    upbit.buy_market_order(symbol, buy_amount)
+                    buy_price = price
+                    bought = True
+                    xrp_balance = upbit.get_balance("XRP")
+                    send_telegram_message(f"📥 매수 진입! 가격: {buy_price:.2f}\nXRP: {xrp_balance:.4f}")
+                else:
+                    send_telegram_message(f"❗️KRW 잔액 부족 또는 조회 실패: {krw_balance}")
                     time.sleep(60)
                     continue
+
             else:
-                try:
-                    upbit.sell_market_order(symbol, 0)
-                except Exception as sell_err:
-                    send_telegram_message(f"❗️매도 주문 실패: {sell_err}")
-                    time.sleep(60)
-                    continue
-
-                if buy_price is None:
-                    send_telegram_message("❗ buy_price가 None입니다. 거래 스킵.")
-                    time.sleep(10)
-                    continue
-
-                profit_percent = ((price - buy_price) / buy_price) * 100
+                balance = upbit.get_balance("XRP")
                 target_profit = buy_price * (1 + profit_ratio)
                 target_loss = buy_price * (1 - loss_ratio)
 
                 if price >= target_profit:
-                    success_count += 1
-                    total_profit_percent += profit_percent
-                    send_telegram_message(f"🎯 익절 완료: {price:.2f}원 (+{profit_percent:.2f}%)")
+                    upbit.sell_market_order(symbol, balance)
+                    send_telegram_message(f"🎯 익절 성공! 매도가: {price:.2f}")
+                    save_trade(buy_price, price, balance, "익절", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                     bought = False
-                    buy_price = None
 
                 elif price <= target_loss:
-                    fail_count += 1
-                    total_profit_percent += profit_percent
-                    send_telegram_message(f"💥 손절 처리: {price:.2f}원 ({profit_percent:.2f}%)")
+                    upbit.sell_market_order(symbol, balance)
+                    send_telegram_message(f"💥 손절 처리! 매도가: {price:.2f}")
+                    save_trade(buy_price, price, balance, "손절", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
                     bought = False
-                    buy_price = None
 
         except Exception as e:
             send_telegram_message(f"⚠️ 오류 발생: {e}")
-            time.sleep(10)
 
         time.sleep(10)
 
+# ✅ 봇 + 웹서버 동시 실행
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
+    threading.Thread(target=run_bot, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
