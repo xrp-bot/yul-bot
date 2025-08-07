@@ -4,7 +4,7 @@ import requests
 import pyupbit
 from datetime import datetime
 
-# ✅ 환경변수에서 텔레그램 정보 불러오기
+# ✅ 환경변수에서 텔레그램 및 업비트 정보 불러오기
 TELEGRAM_TOKEN = os.getenv("8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc")
 TELEGRAM_CHAT_ID = os.getenv("1054008930")
 ACCESS_KEY = os.getenv("lOmAytTKb4QJpEsWpDWyOcBHtyAfEod2vxjgesBF")
@@ -48,23 +48,18 @@ def run_bot():
     fail_count = 0
     total_profit_percent = 0
 
-    upbit = pyupbit.Upbit(UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY)
+    upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
     send_telegram_message("🤖 자동매매 봇 실행됨")
 
-   while True:
-    try:
-        now = datetime.now()
-        price = pyupbit.get_current_price(symbol)
+    while True:
+        try:
+            now = datetime.now()
+            price = pyupbit.get_current_price(symbol)
 
-        # 📌 오전 9시 리포트
-        if last_report_date != now.date() and now.hour == 9:
-            daily_report(success_count, fail_count, total_profit_percent)
-            last_report_date = now.date()
-
-    except Exception as e:
-        print("에러 발생:", e)
-        time.sleep(5)  # 오류 시 잠깐 대기하고 재시작
-
+            # 📌 오전 9시 리포트
+            if last_report_date != now.date() and now.hour == 9:
+                daily_report(success_count, fail_count, total_profit_percent)
+                last_report_date = now.date()
 
             if not bought:
                 krw = upbit.get_balance("KRW")
@@ -101,5 +96,4 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
-
 
