@@ -1,4 +1,4 @@
-# main.py (Render 대응, KRW 잔액 조회 안정화)
+# main.py
 import os
 import time
 import requests
@@ -13,7 +13,7 @@ app = Flask(__name__)
 def index():
     return "✅ Yul Bot is running on Render (Web Service)"
 
-# ✅ 환경 변수 가져오기
+# 환경 변수
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -26,7 +26,7 @@ bought = False
 buy_price = None
 last_report_date = None
 
-# ✅ 텔레그램 알림
+# 텔레그램 알림
 def send_telegram_message(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -35,7 +35,7 @@ def send_telegram_message(message):
     except Exception as e:
         print("🚨 텔레그램 전송 오류:", e)
 
-# ✅ 매일 수익 리포트
+# 수익 리포트
 def daily_report(success_count, fail_count, total_profit_percent):
     total = success_count + fail_count
     rate = (success_count / total) * 100 if total > 0 else 0
@@ -48,7 +48,7 @@ def daily_report(success_count, fail_count, total_profit_percent):
     )
     send_telegram_message(msg)
 
-# ✅ 안정적인 잔액 조회 (최대 3회 재시도)
+# 잔액 재시도 로직 (❗ 알림 제거)
 def get_balance_with_retry(upbit, currency, retries=3, delay=2):
     for _ in range(retries):
         balance = upbit.get_balance(currency)
@@ -57,7 +57,7 @@ def get_balance_with_retry(upbit, currency, retries=3, delay=2):
         time.sleep(delay)
     return None
 
-# ✅ 메인 봇 로직
+# 메인 봇
 def run_bot():
     global bought, buy_price, last_report_date
     success_count = 0
@@ -141,5 +141,5 @@ def run_bot():
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot).start()
-    port = int(os.environ.get("PORT", 5000))  # ✅ Render에서 요구하는 포트
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
