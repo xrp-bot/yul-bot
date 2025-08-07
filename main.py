@@ -13,7 +13,7 @@ app = Flask(__name__)
 def index():
     return "✅ Yul Bot is running on Render (Web Service)"
 
-# ✅ 환경변수에서 키값 불러오기
+# ✅ 환경 변수 가져오기
 ACCESS_KEY = os.getenv("ACCESS_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -59,6 +59,9 @@ def run_bot():
         try:
             now = datetime.now()
             price = pyupbit.get_current_price(symbol)
+            if price is None:
+                time.sleep(10)
+                continue
 
             if last_report_date != now.date() and now.hour == 9:
                 daily_report(success_count, fail_count, total_profit_percent)
@@ -66,13 +69,16 @@ def run_bot():
 
             if not bought:
                 krw = upbit.get_balance("KRW")
-                if krw > 5000:
+                if krw is not None and krw > 5000:
                     upbit.buy_market_order(symbol, krw * 0.9995)
                     buy_price = price
                     bought = True
                     send_telegram_message(f"📥 매수 진입: {buy_price:.2f}원")
             else:
                 xrp_balance = upbit.get_balance("XRP")
+                if xrp_balance is None:
+                    continue
+
                 target_profit = buy_price * (1 + profit_ratio)
                 target_loss = buy_price * (1 - loss_ratio)
 
@@ -99,6 +105,5 @@ def run_bot():
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot).start()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))  # ✅ Render에서 요구하는 포트
     app.run(host="0.0.0.0", port=port)
-
