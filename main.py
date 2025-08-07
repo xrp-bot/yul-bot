@@ -1,4 +1,4 @@
-O# main.py (환경변수 방식, Render Web Service 대응)
+# main.py (환경변수 방식, Render Web Service 대응)
 import os
 import time
 import requests
