@@ -1,25 +1,31 @@
+# main.py (수정된 포트 바인딩 포함)
 import os
 import time
 import requests
 import pyupbit
+import threading
 from datetime import datetime
+from flask import Flask
 
-# ✅ 환경변수에서 텔레그램 및 업비트 정보 불러오기
-TELEGRAM_TOKEN = os.getenv("8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc")
-TELEGRAM_CHAT_ID = os.getenv("1054008930")
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "✅ Yul Bot is running on Render (Web Service)"
+
+# ✅ 환경 변수
 ACCESS_KEY = os.getenv("lOmAytTKb4QJpEsWpDWyOcBHtyAfEod2vxjgesBF")
 SECRET_KEY = os.getenv("VtAJf1FZfiH2kmV1AdKFoaaePaH1xqeTFzxDw45O")
+TELEGRAM_TOKEN = os.getenv("8358935066:AAEkuHKK-pP6lgaiFwafH-kceW_1Sfc-EOc")
+TELEGRAM_CHAT_ID = os.getenv("1054008930")
 
-
-# ✅ 기본 설정
 symbol = "KRW-XRP"
-profit_ratio = 0.03  # 3% 익절
-loss_ratio = 0.01    # 1% 손절
+profit_ratio = 0.03
+loss_ratio = 0.01
 bought = False
 buy_price = 0
 last_report_date = None
 
-# ✅ 텔레그램 메시지 전송 함수
 def send_telegram_message(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -28,7 +34,6 @@ def send_telegram_message(message):
     except Exception as e:
         print("🚨 텔레그램 전송 오류:", e)
 
-# ✅ 리포트 전송 함수 (매일 오전 9시)
 def daily_report(success_count, fail_count, total_profit_percent):
     total = success_count + fail_count
     rate = (success_count / total) * 100 if total > 0 else 0
@@ -41,7 +46,6 @@ def daily_report(success_count, fail_count, total_profit_percent):
     )
     send_telegram_message(msg)
 
-# ✅ 메인 자동매매 루프
 def run_bot():
     global bought, buy_price, last_report_date
     success_count = 0
@@ -49,14 +53,13 @@ def run_bot():
     total_profit_percent = 0
 
     upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
-    send_telegram_message("🤖 자동매매 봇 실행됨")
+    send_telegram_message("🤖 자동매매 봇 실행됨 (Render Web Service)")
 
     while True:
         try:
             now = datetime.now()
             price = pyupbit.get_current_price(symbol)
 
-            # 📌 오전 9시 리포트
             if last_report_date != now.date() and now.hour == 9:
                 daily_report(success_count, fail_count, total_profit_percent)
                 last_report_date = now.date()
@@ -95,5 +98,7 @@ def run_bot():
         time.sleep(10)
 
 if __name__ == "__main__":
-    run_bot()
+    threading.Thread(target=run_bot).start()
+    port = int(os.environ.get("PORT", 5000))  # ✅ Render가 요구하는 포트 사용
+    app.run(host="0.0.0.0", port=port)
 
