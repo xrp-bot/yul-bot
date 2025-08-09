@@ -1,4 +1,4 @@
-# main.py — Render/Upbit Bot (robust balances, MA filter, /status, /diag+headers, rate-limit backoff)
+# main.py — Render/Upbit Bot (robust balances, MA filter, /status, /diag+headers, rate-limit backoff, /health)
 
 import os
 import time
@@ -20,6 +20,10 @@ app = Flask(__name__)
 @app.route("/")
 def index():
     return "✅ Yul Bot is running (Web Service)"
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "ts": datetime.now().isoformat()}), 200
 
 @app.route("/status")
 def status():
@@ -145,7 +149,7 @@ def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid,
             ts, side, f"{qty:.6f}", f"{avg_price:.6f}",
             f"{realized_krw:.2f}", f"{pnl_pct:.2f}", buy_uuid or "", sell_uuid or ""
         ])
-    # 선택: 텔레그램으로 백업 로그 전송
+    # 선택: 텔레그램 백업 로그
     try:
         send_telegram(f"[LOG] {ts} {side} qty={qty:.6f} avg={avg_price:.2f} PnL₩={realized_krw:.0f}({pnl_pct:.2f}%)")
     except Exception:
@@ -502,6 +506,7 @@ def supervisor():
 # Entrypoint
 # -------------------------------
 if __name__ == "__main__":
+    # 로컬 실행 시 개발서버로 돌림 (Render/운영에선 gunicorn 권장)
     threading.Thread(target=supervisor, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))  # Render 기본 PORT는 10000
     app.run(host="0.0.0.0", port=port)
