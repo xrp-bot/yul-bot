@@ -1,4 +1,4 @@
-# main.py — Clean Render/Upbit Bot with MA filter, /status, watchdog, robust balances
+# main.py — Render/Upbit Bot (robust balances, MA filter, /status, /diag+headers, rate-limit backoff)
 
 import os
 import time
@@ -24,7 +24,7 @@ def index():
 @app.route("/status")
 def status():
     try:
-        price = pyupbit.get_current_price(SYMBOL)
+        price = get_price_safe(SYMBOL)
         ok, last_close, sma_s, sma_l, allow = get_ma_signal()
         data = {
             "symbol": SYMBOL,
@@ -45,12 +45,16 @@ def status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── 진단용: 업비트 /v1/accounts 원본 콜로 HTTP 상태/본문 보기
+# ── 진단용: 업비트 /v1/accounts 원본 콜로 HTTP 상태/본문/헤더 보기
 @app.route("/diag")
 def diag():
     try:
-        status_code, body = call_accounts_raw()
-        return jsonify({"status": status_code, "body": body})
+        status_code, body, headers = call_accounts_raw_with_headers()
+        return jsonify({
+            "status": status_code,
+            "body": body,
+            "remaining_req": headers.get("Remaining-Req"),
+        })
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
@@ -70,7 +74,7 @@ USE_MA_FILTER   = os.getenv("USE_MA_FILTER", "true").lower() == "true"
 MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")
 MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
-MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
+MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))  # 호출 줄이기
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
 
@@ -141,23 +145,47 @@ def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid,
             ts, side, f"{qty:.6f}", f"{avg_price:.6f}",
             f"{realized_krw:.2f}", f"{pnl_pct:.2f}", buy_uuid or "", sell_uuid or ""
         ])
+    # 선택: 텔레그램으로 백업 로그 전송
+    try:
+        send_telegram(f"[LOG] {ts} {side} qty={qty:.6f} avg={avg_price:.2f} PnL₩={realized_krw:.0f}({pnl_pct:.2f}%)")
+    except Exception:
+        pass
 
 # -------------------------------
 # 업비트 원본 /v1/accounts 호출 (진단)
 # -------------------------------
-def call_accounts_raw():
-    """JWT로 /v1/accounts를 직접 호출해 상태코드/본문을 반환."""
+def call_accounts_raw_with_headers():
+    """JWT로 /v1/accounts를 직접 호출해 상태코드/본문/헤더를 반환."""
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
     payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
     token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
-    return r.status_code, r.text
-# 참고: 업비트 Private API는 JWT Authorization이 필수입니다. 허용 IP 범위 밖이면 실패합니다. :contentReference[oaicite:2]{index=2}
+    return r.status_code, r.text, r.headers
+# Upbit는 JWT 인증 + Remaining-Req 헤더로 레이트리밋을 제공합니다.
 
 # -------------------------------
-# 잔고 유틸 (모두 float로 통일)
+# 레이트리밋 백오프 (공통)
+# -------------------------------
+def backoff_from_headers(headers, base=1.0, max_sleep=10.0):
+    """
+    Remaining-Req: group=default; min=1800; sec=29
+    sec 값이 바닥이면 잠깐 대기. 헤더가 없으면 기본 대기.
+    """
+    rem = headers.get("Remaining-Req") if headers else None
+    if rem and "sec=" in rem:
+        try:
+            sec_left = int(rem.split("sec=")[1].split(";")[0])
+            if sec_left <= 1:
+                time.sleep(min(base * 2, max_sleep))
+                return
+        except Exception:
+            pass
+    time.sleep(base)
+
+# -------------------------------
+# 잔고/시세 유틸 (모두 float로 통일, 재시도 포함)
 # -------------------------------
 def _to_float(x):
     try:
@@ -167,7 +195,7 @@ def _to_float(x):
 
 def get_balance_float(upbit, ticker: str, retry=3, delay=0.8):
     """pyupbit.get_balance 래퍼: 항상 float 또는 None을 반환."""
-    for _ in range(retry):
+    for i in range(retry):
         try:
             val = upbit.get_balance(ticker)  # 문자열/float/None
             fv = _to_float(val)
@@ -175,7 +203,7 @@ def get_balance_float(upbit, ticker: str, retry=3, delay=0.8):
                 return fv
         except Exception as e:
             print(f"[get_balance_float:{ticker}] {type(e).__name__}: {e}")
-        time.sleep(delay)
+        time.sleep(delay * (i + 1))
     return None
 
 def get_krw_balance_safely(upbit, retry=3, delay=0.8):
@@ -219,12 +247,25 @@ def avg_price_from_balances_sell(krw_before, krw_after, qty_delta):
         return None
     return received / qty_delta
 
+def get_price_safe(symbol, tries=3, delay=0.6):
+    for i in range(tries):
+        p = pyupbit.get_current_price(symbol)
+        if p is not None:
+            return float(p)
+        time.sleep(delay * (i + 1))
+    return None
+
+def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
+    for i in range(tries):
+        df = pyupbit.get_ohlcv(symbol, interval=interval, count=count)
+        if df is not None and not df.empty:
+            return df
+        time.sleep(delay * (i + 1))
+    return None
+
 # -------------------------------
 # MA Signal (캐시)
 # -------------------------------
-_last_ma_update_ts = 0.0
-_cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
-
 def get_ma_signal():
     """
     return: (ok, last_close, sma_short, sma_long, allow_buy)
@@ -241,7 +282,7 @@ def get_ma_signal():
 
     try:
         cnt = max(MA_LONG + 5, 30)
-        df = pyupbit.get_ohlcv(SYMBOL, interval=MA_INTERVAL, count=cnt)
+        df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
         if df is None or df.empty or "close" not in df.columns:
             _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
             _last_ma_update_ts = now_ts
@@ -271,6 +312,17 @@ def get_ma_signal():
         return False, None, None, None, False
 
 # -------------------------------
+# 주문 응답 방어
+# -------------------------------
+def _extract_uuid(r):
+    if isinstance(r, dict):
+        if "error" in r:
+            print(f"[UPBIT ORDER ERROR] {r['error']}")
+            return None
+        return r.get("uuid")
+    return None
+
+# -------------------------------
 # Orders
 # -------------------------------
 def market_buy_all(upbit):
@@ -281,15 +333,17 @@ def market_buy_all(upbit):
             print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
             return None, None, None
 
-        # pyupbit는 buy_market_order의 금액이 '수수료 제외 금액'
-        # 수수료 0.05% 기준으로 약간 보수적으로 사용
+        # pyupbit: 시장가 매수 금액은 수수료 제외 금액 → 보수적으로 집행
         spend = krw_before * 0.9990
         r = upbit.buy_market_order(SYMBOL, spend)
-        buy_uuid = r.get("uuid") if isinstance(r, dict) else None
+        buy_uuid = _extract_uuid(r)
+        if buy_uuid is None:
+            print("[BUY] 주문 실패 응답:", r)
+            return None, None, None
         print(f"[BUY] 주문 전송 - KRW 사용 예정: {spend:.2f}, uuid={buy_uuid}")
 
         xrp_after = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
-                                        xrp_before, cmp="gt", timeout=20, interval=0.5)
+                                        xrp_before, cmp="gt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[BUY] 체결 확인 실패 (타임아웃)")
             return None, None, buy_uuid
@@ -314,11 +368,14 @@ def market_sell_all(upbit):
             return None, None, None, None
 
         r = upbit.sell_market_order(SYMBOL, xrp_before)
-        sell_uuid = r.get("uuid") if isinstance(r, dict) else None
+        sell_uuid = _extract_uuid(r)
+        if sell_uuid is None:
+            print("[SELL] 주문 실패 응답:", r)
+            return None, None, None, None
         print(f"[SELL] 주문 전송 - qty={xrp_before:.6f}, uuid={sell_uuid}")
 
         xrp_after = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
-                                        xrp_before, cmp="lt", timeout=20, interval=0.5)
+                                        xrp_before, cmp="lt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[SELL] 체결 확인 실패 (타임아웃)")
             return None, None, None, sell_uuid
@@ -342,12 +399,15 @@ def run_bot_loop():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY missing")
 
-    # 업비트 초기 진단: /v1/accounts 호출 한 번
+    # 업비트 초기 진단: /v1/accounts 호출 한 번 (상태/헤더 확인)
     try:
-        sc, body = call_accounts_raw()
+        sc, body, headers = call_accounts_raw_with_headers()
         if sc != 200:
             print(f"[DIAG] /v1/accounts 실패: {sc} {body}")
             send_telegram(f"❗️업비트 인증/허용IP/레이트리밋 점검 필요: {sc}")
+            backoff_from_headers(headers)
+        else:
+            print(f"[DIAG] OK Remaining-Req: {headers.get('Remaining-Req')}")
     except Exception as e:
         print(f"[DIAG 예외] {e}")
 
@@ -362,7 +422,7 @@ def run_bot_loop():
 
     while True:
         try:
-            price = pyupbit.get_current_price(SYMBOL)
+            price = get_price_safe(SYMBOL)
             if price is None:
                 time.sleep(2)
                 continue
