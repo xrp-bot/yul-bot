@@ -1,4 +1,4 @@
-# main.py — Clean Render/Upbit Bot with MA filter, /status, watchdog
+# main.py — Clean Render/Upbit Bot with MA filter, /status, watchdog, robust balances
 
 import os
 import time
@@ -7,6 +7,8 @@ import pyupbit
 import threading
 import asyncio
 import traceback
+import uuid
+import jwt
 from datetime import datetime
 from flask import Flask, jsonify
 
@@ -22,10 +24,8 @@ def index():
 @app.route("/status")
 def status():
     try:
-        # 즉시 상태 계산(캐시 활용)
         price = pyupbit.get_current_price(SYMBOL)
         ok, last_close, sma_s, sma_l, allow = get_ma_signal()
-        # 내부 공유 상태도 포함
         data = {
             "symbol": SYMBOL,
             "price": price,
@@ -45,25 +45,44 @@ def status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── 진단용: 업비트 /v1/accounts 원본 콜로 HTTP 상태/본문 보기
+@app.route("/diag")
+def diag():
+    try:
+        status_code, body = call_accounts_raw()
+        return jsonify({"status": status_code, "body": body})
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
 # -------------------------------
 # ENV & Strategy Params
 # -------------------------------
-ACCESS_KEY     = os.getenv("ACCESS_KEY")
-SECRET_KEY     = os.getenv("SECRET_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ACCESS_KEY       = os.getenv("ACCESS_KEY")
+SECRET_KEY       = os.getenv("SECRET_KEY")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL        = os.getenv("SYMBOL", "KRW-XRP")  # 바꾸고 싶으면 env로
+SYMBOL        = os.getenv("SYMBOL", "KRW-XRP")
 PROFIT_RATIO  = float(os.getenv("PROFIT_RATIO", "0.03"))  # +3% 익절
 LOSS_RATIO    = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1% 손절
 
 USE_MA_FILTER   = os.getenv("USE_MA_FILTER", "true").lower() == "true"
-MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")  # 5분봉
+MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")
 MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
+
+def _mask(s, keep=4):
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep)
+
+# 환경변수 점검 (마스킹만 출력)
+print(f"[ENV] ACCESS_KEY={_mask(ACCESS_KEY)} SECRET_KEY={_mask(SECRET_KEY)} SYMBOL={SYMBOL}")
 
 # -------------------------------
 # Shared State
@@ -82,7 +101,7 @@ _last_ma_update_ts = 0.0
 _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
 
 # -------------------------------
-# Telegram (시작/종료/매수/익절/손절/재시작만)
+# Telegram
 # -------------------------------
 def _post_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -124,32 +143,57 @@ def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid,
         ])
 
 # -------------------------------
-# 잔고/체결 유틸
+# 업비트 원본 /v1/accounts 호출 (진단)
 # -------------------------------
-def get_krw_balance_safely(upbit, retry=3, delay=1.0):
+def call_accounts_raw():
+    """JWT로 /v1/accounts를 직접 호출해 상태코드/본문을 반환."""
+    if not ACCESS_KEY or not SECRET_KEY:
+        raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
+    payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
+    token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
+    return r.status_code, r.text
+# 참고: 업비트 Private API는 JWT Authorization이 필수입니다. 허용 IP 범위 밖이면 실패합니다. :contentReference[oaicite:2]{index=2}
+
+# -------------------------------
+# 잔고 유틸 (모두 float로 통일)
+# -------------------------------
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def get_balance_float(upbit, ticker: str, retry=3, delay=0.8):
+    """pyupbit.get_balance 래퍼: 항상 float 또는 None을 반환."""
     for _ in range(retry):
         try:
-            krw = upbit.get_balance("KRW")
-            if krw is not None:
-                return krw
-        except TypeError as te:
-            print(f"[❗TypeError - KRW 잔고] {te}")
+            val = upbit.get_balance(ticker)  # 문자열/float/None
+            fv = _to_float(val)
+            if fv is not None:
+                return fv
         except Exception as e:
-            print(f"[❗KRW 잔고 조회 실패] {e}")
+            print(f"[get_balance_float:{ticker}] {type(e).__name__}: {e}")
         time.sleep(delay)
     return None
 
-def wait_balance_change(getter, before, cmp="gt", timeout=20, interval=0.5):
+def get_krw_balance_safely(upbit, retry=3, delay=0.8):
+    return get_balance_float(upbit, "KRW", retry=retry, delay=delay)
+
+def wait_balance_change(getter_float, before_float, cmp="gt", timeout=20, interval=0.5):
+    """getter_float는 float 또는 None을 반환해야 함."""
     waited = 0.0
     while waited < timeout:
+        nowb = None
         try:
-            nowb = getter()
+            nowb = getter_float()
         except Exception:
             nowb = None
-        if nowb is not None:
-            if cmp == "gt" and nowb > before + 1e-12:
+        if nowb is not None and before_float is not None:
+            if cmp == "gt" and nowb > before_float + 1e-12:
                 return nowb
-            if cmp == "lt" and nowb < before - 1e-12:
+            if cmp == "lt" and nowb < before_float - 1e-12:
                 return nowb
         time.sleep(interval)
         waited += interval
@@ -157,6 +201,8 @@ def wait_balance_change(getter, before, cmp="gt", timeout=20, interval=0.5):
 
 def avg_price_from_balances_buy(krw_before, krw_after, qty_delta):
     if not qty_delta or qty_delta <= 0:
+        return None
+    if krw_before is None or krw_after is None:
         return None
     spent = krw_before - krw_after
     if spent <= 0:
@@ -166,6 +212,8 @@ def avg_price_from_balances_buy(krw_before, krw_after, qty_delta):
 def avg_price_from_balances_sell(krw_before, krw_after, qty_delta):
     if not qty_delta or qty_delta <= 0:
         return None
+    if krw_before is None or krw_after is None:
+        return None
     received = krw_after - krw_before
     if received <= 0:
         return None
@@ -174,6 +222,9 @@ def avg_price_from_balances_sell(krw_before, krw_after, qty_delta):
 # -------------------------------
 # MA Signal (캐시)
 # -------------------------------
+_last_ma_update_ts = 0.0
+_cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
+
 def get_ma_signal():
     """
     return: (ok, last_close, sma_short, sma_long, allow_buy)
@@ -225,17 +276,20 @@ def get_ma_signal():
 def market_buy_all(upbit):
     try:
         krw_before = get_krw_balance_safely(upbit)
-        xrp_before = upbit.get_balance("XRP")
+        xrp_before = get_balance_float(upbit, "XRP")
         if krw_before is None or krw_before <= 5000:
             print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
             return None, None, None
 
-        spend = krw_before * 0.9995
+        # pyupbit는 buy_market_order의 금액이 '수수료 제외 금액'
+        # 수수료 0.05% 기준으로 약간 보수적으로 사용
+        spend = krw_before * 0.9990
         r = upbit.buy_market_order(SYMBOL, spend)
         buy_uuid = r.get("uuid") if isinstance(r, dict) else None
         print(f"[BUY] 주문 전송 - KRW 사용 예정: {spend:.2f}, uuid={buy_uuid}")
 
-        xrp_after = wait_balance_change(lambda: upbit.get_balance("XRP"), xrp_before, cmp="gt", timeout=20, interval=0.5)
+        xrp_after = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
+                                        xrp_before, cmp="gt", timeout=20, interval=0.5)
         if xrp_after is None:
             print("[BUY] 체결 확인 실패 (타임아웃)")
             return None, None, buy_uuid
@@ -253,7 +307,7 @@ def market_buy_all(upbit):
 
 def market_sell_all(upbit):
     try:
-        xrp_before = upbit.get_balance("XRP")
+        xrp_before = get_balance_float(upbit, "XRP")
         krw_before = get_krw_balance_safely(upbit)
         if xrp_before is None or xrp_before <= 0:
             print("[SELL] XRP 부족 또는 조회 실패:", xrp_before)
@@ -263,7 +317,8 @@ def market_sell_all(upbit):
         sell_uuid = r.get("uuid") if isinstance(r, dict) else None
         print(f"[SELL] 주문 전송 - qty={xrp_before:.6f}, uuid={sell_uuid}")
 
-        xrp_after = wait_balance_change(lambda: upbit.get_balance("XRP"), xrp_before, cmp="lt", timeout=20, interval=0.5)
+        xrp_after = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
+                                        xrp_before, cmp="lt", timeout=20, interval=0.5)
         if xrp_after is None:
             print("[SELL] 체결 확인 실패 (타임아웃)")
             return None, None, None, sell_uuid
@@ -284,6 +339,18 @@ def market_sell_all(upbit):
 # Main Loop & Supervisor
 # -------------------------------
 def run_bot_loop():
+    if not ACCESS_KEY or not SECRET_KEY:
+        raise RuntimeError("ACCESS_KEY/SECRET_KEY missing")
+
+    # 업비트 초기 진단: /v1/accounts 호출 한 번
+    try:
+        sc, body = call_accounts_raw()
+        if sc != 200:
+            print(f"[DIAG] /v1/accounts 실패: {sc} {body}")
+            send_telegram(f"❗️업비트 인증/허용IP/레이트리밋 점검 필요: {sc}")
+    except Exception as e:
+        print(f"[DIAG 예외] {e}")
+
     upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
     send_telegram("🤖 자동매매 봇 실행됨 (Web Service)")
     BOT_STATE["running"] = True
@@ -353,12 +420,11 @@ def run_bot_loop():
         except TypeError:
             print(f"[❗TypeError]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "TypeError in loop"
-            time.sleep(3)  # 계속 진행
+            time.sleep(3)
 
         except Exception:
             print(f"[❗루프 예외]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "Loop Exception"
-            # Supervisor가 재시작하도록 예외 전달
             raise
 
         time.sleep(2)
@@ -376,9 +442,6 @@ def supervisor():
 # Entrypoint
 # -------------------------------
 if __name__ == "__main__":
-    # Supervisor로 봇 백그라운드 실행
     threading.Thread(target=supervisor, daemon=True).start()
-
-    # Flask Run (Render가 PORT를 내려줌)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
