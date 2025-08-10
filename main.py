@@ -1,4 +1,5 @@
 # main.py — Render/Upbit Bot (robust balances, MA filter, /status, /diag+headers, rate-limit backoff, /health)
+# + admin allow toggle, skip-reason telemetry, richer /status
 
 import os
 import time
@@ -29,7 +30,9 @@ def health():
 def status():
     try:
         price = get_price_safe(SYMBOL)
-        ok, last_close, sma_s, sma_l, allow = get_ma_signal()
+        ok, last_close, sma_s, sma_l, allow_by_ma = get_ma_signal()
+        # 최종 allow: 관리자 토글 + (필요 시) MA 필터
+        final_allow = (not USE_MA_FILTER or allow_by_ma) and BOT_STATE["admin_allow_buy"]
         data = {
             "symbol": SYMBOL,
             "price": price,
@@ -37,12 +40,15 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "allow_buy": allow,
+            "allow_by_ma": allow_by_ma,
+            "admin_allow_buy": BOT_STATE["admin_allow_buy"],
+            "allow_buy": final_allow,  # 최종 판정
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
             "last_trade_time": BOT_STATE["last_trade_time"],
             "last_error": BOT_STATE["last_error"],
+            "last_reason": BOT_STATE["last_reason"],
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         return jsonify(data)
@@ -61,6 +67,19 @@ def diag():
         })
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+# ── 관리자 토글: 매수 허용/차단
+@app.route("/enable_buy")
+def enable_buy():
+    BOT_STATE["admin_allow_buy"] = True
+    BOT_STATE["last_reason"] = None
+    return jsonify({"ok": True, "admin_allow_buy": True})
+
+@app.route("/disable_buy")
+def disable_buy():
+    BOT_STATE["admin_allow_buy"] = False
+    BOT_STATE["last_reason"] = "관리자 차단"
+    return jsonify({"ok": True, "admin_allow_buy": False})
 
 # -------------------------------
 # ENV & Strategy Params
@@ -102,6 +121,8 @@ BOT_STATE = {
     "buy_qty": 0.0,
     "last_error": None,
     "last_trade_time": None,
+    "last_reason": None,           # ⬅️ 스킵 사유/차단 사유
+    "admin_allow_buy": True,       # ⬅️ 관리자 토글 (기본 허용)
 }
 
 # MA 캐시
@@ -131,6 +152,14 @@ def send_telegram(msg: str):
         asyncio.set_event_loop(loop)
         loop.run_until_complete(_send_telegram_async(msg))
         loop.close()
+
+def set_reason(reason: str, also_telegram=False):
+    BOT_STATE["last_reason"] = reason
+    if also_telegram:
+        try:
+            send_telegram(f"❗️스킵: {reason}")
+        except Exception:
+            pass
 
 # -------------------------------
 # CSV 저장 (체결내역)
@@ -262,7 +291,7 @@ def get_price_safe(symbol, tries=3, delay=0.6):
 def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
     for i in range(tries):
         df = pyupbit.get_ohlcv(symbol, interval=interval, count=count)
-        if df is not None and not df.empty:
+        if df is not None and not df.empty and "close" in df.columns:
             return df
         time.sleep(delay * (i + 1))
     return None
@@ -272,8 +301,8 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
 # -------------------------------
 def get_ma_signal():
     """
-    return: (ok, last_close, sma_short, sma_long, allow_buy)
-    allow_buy: (last > SMA_short) and (SMA_short > SMA_long)
+    return: (ok, last_close, sma_short, sma_long, allow_by_ma)
+    allow_by_ma: (last > SMA_short) and (SMA_short > SMA_long)
     """
     global _last_ma_update_ts, _cached_ma
 
@@ -306,7 +335,7 @@ def get_ma_signal():
         _last_ma_update_ts = now_ts
 
         allow = (last_close > sma_s) and (sma_s > sma_l)
-        print(f"[MA] last={last_close:.4f}, SMA{MA_SHORT}={sma_s:.4f}, SMA{MA_LONG}={sma_l:.4f}, allow_buy={allow}")
+        print(f"[MA] last={last_close:.4f}, SMA{MA_SHORT}={sma_s:.4f}, SMA{MA_LONG}={sma_l:.4f}, allow_by_ma={allow}")
         return True, last_close, sma_s, sma_l, allow
 
     except Exception:
@@ -335,6 +364,7 @@ def market_buy_all(upbit):
         xrp_before = get_balance_float(upbit, "XRP")
         if krw_before is None or krw_before <= 5000:
             print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
+            set_reason(f"최소주문금액 미만 또는 KRW 조회 실패 (krw={krw_before})", also_telegram=True)
             return None, None, None
 
         # pyupbit: 시장가 매수 금액은 수수료 제외 금액 → 보수적으로 집행
@@ -343,6 +373,7 @@ def market_buy_all(upbit):
         buy_uuid = _extract_uuid(r)
         if buy_uuid is None:
             print("[BUY] 주문 실패 응답:", r)
+            set_reason(f"주문 실패 응답: {r}", also_telegram=True)
             return None, None, None
         print(f"[BUY] 주문 전송 - KRW 사용 예정: {spend:.2f}, uuid={buy_uuid}")
 
@@ -350,6 +381,7 @@ def market_buy_all(upbit):
                                         xrp_before, cmp="gt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[BUY] 체결 확인 실패 (타임아웃)")
+            set_reason("매수 체결 확인 실패(타임아웃)", also_telegram=True)
             return None, None, buy_uuid
 
         filled = xrp_after - xrp_before
@@ -361,6 +393,7 @@ def market_buy_all(upbit):
     except Exception:
         print(f"[BUY 예외]\n{traceback.format_exc()}")
         BOT_STATE["last_error"] = f"BUY: {traceback.format_exc()}"
+        set_reason("매수 예외 발생", also_telegram=True)
         return None, None, None
 
 def market_sell_all(upbit):
@@ -369,12 +402,14 @@ def market_sell_all(upbit):
         krw_before = get_krw_balance_safely(upbit)
         if xrp_before is None or xrp_before <= 0:
             print("[SELL] XRP 부족 또는 조회 실패:", xrp_before)
+            set_reason(f"보유수량 부족/조회 실패 (xrp={xrp_before})", also_telegram=True)
             return None, None, None, None
 
         r = upbit.sell_market_order(SYMBOL, xrp_before)
         sell_uuid = _extract_uuid(r)
         if sell_uuid is None:
             print("[SELL] 주문 실패 응답:", r)
+            set_reason(f"매도 주문 실패 응답: {r}", also_telegram=True)
             return None, None, None, None
         print(f"[SELL] 주문 전송 - qty={xrp_before:.6f}, uuid={sell_uuid}")
 
@@ -382,6 +417,7 @@ def market_sell_all(upbit):
                                         xrp_before, cmp="lt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[SELL] 체결 확인 실패 (타임아웃)")
+            set_reason("매도 체결 확인 실패(타임아웃)", also_telegram=True)
             return None, None, None, sell_uuid
 
         filled = xrp_before - xrp_after
@@ -394,6 +430,7 @@ def market_sell_all(upbit):
     except Exception:
         print(f"[SELL 예외]\n{traceback.format_exc()}")
         BOT_STATE["last_error"] = f"SELL: {traceback.format_exc()}"
+        set_reason("매도 예외 발생", also_telegram=True)
         return None, None, None, None
 
 # -------------------------------
@@ -428,29 +465,44 @@ def run_bot_loop():
         try:
             price = get_price_safe(SYMBOL)
             if price is None:
+                set_reason("시세 조회 실패(None)", also_telegram=False)
                 time.sleep(2)
                 continue
 
-            # 미보유 → 매수
+            # 미보유 → 매수 판단
             if not bought:
+                # 관리자 차단 여부 먼저 확인
+                if not BOT_STATE["admin_allow_buy"]:
+                    set_reason("관리자 차단(admin_allow_buy=False)", also_telegram=False)
+                    time.sleep(2)
+                    continue
+
                 allow = True
+                allow_by_ma = True
                 if USE_MA_FILTER:
-                    ok, last, s, l, allow_buy = get_ma_signal()
-                    if not ok or not allow_buy:
+                    ok, last, s, l, allow_by_ma = get_ma_signal()
+                    if not ok:
+                        set_reason("MA 데이터 부족/조회 실패", also_telegram=False)
                         time.sleep(2)
                         continue
-                    allow = allow_buy
+                    if not allow_by_ma:
+                        set_reason(f"MA 필터 차단 (last={last:.2f}, s={s:.2f}, l={l:.2f})", also_telegram=False)
+                        time.sleep(2)
+                        continue
+                    allow = allow_by_ma
 
                 if allow:
                     avg_buy, qty, buuid = market_buy_all(upbit)
                     if avg_buy is not None and qty and qty > 0:
                         bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
                         BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
-                                          "last_trade_time": datetime.now().isoformat()})
+                                          "last_trade_time": datetime.now().isoformat(), "last_reason": None})
                         send_telegram(f"📥 매수 진입! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
                     else:
+                        # 실패 사유는 market_buy_all에서 last_reason으로 기록됨
                         time.sleep(10)
                 else:
+                    set_reason("내부 allow=False (예상치 못한 분기)", also_telegram=False)
                     time.sleep(2)
                 continue
 
@@ -477,18 +529,20 @@ def run_bot_loop():
                     )
                     bought, buy_price, buy_qty, buy_uuid = False, 0.0, 0.0, None
                     BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
-                                      "last_trade_time": datetime.now().isoformat()})
+                                      "last_trade_time": datetime.now().isoformat(), "last_reason": None})
                 else:
                     time.sleep(8)
 
         except TypeError:
             print(f"[❗TypeError]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "TypeError in loop"
+            set_reason("TypeError in loop", also_telegram=False)
             time.sleep(3)
 
         except Exception:
             print(f"[❗루프 예외]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "Loop Exception"
+            set_reason("Loop Exception", also_telegram=True)
             raise
 
         time.sleep(2)
