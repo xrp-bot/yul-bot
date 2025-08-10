@@ -1,8 +1,9 @@
-# main.py — Upbit Bot (Golden Cross only)
+# main.py — Upbit Bot (Golden Cross only + Signal Alerts)
 # - Strategy: BUY when SMA_SHORT crosses above SMA_LONG within last N closed candles
-# - EXIT: TP/SL
+# - Alerts: Telegram on "signal detected" (deduplicated) + on fills (buy/sell)
+# - Exit: Take-Profit / Stop-Loss
 # - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, rate-limit backoff
-# - NOTE: All previous entry filters are removed; ONLY golden-cross decides entries.
+# - NOTE: Entry는 오직 골든크로스만 사용. 기존 필터/조건 제거됨.
 
 import os
 import time
@@ -43,20 +44,22 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "gc_recent": gc_ok,           # 최근 N봉 내 골든크로스?
-            "gc_bars_ago": bars_ago,      # 몇 봉 전에 발생했는지 (1=직전봉, 2=그 전 봉 ...)
+            "gc_recent": gc_ok,                 # 최근 N봉 내 골든크로스?
+            "gc_bars_ago": bars_ago,            # 1=직전봉, 2=그 전 봉 ...
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
             "last_trade_time": BOT_STATE["last_trade_time"],
             "last_error": BOT_STATE["last_error"],
+            "last_signal_time": BOT_STATE["last_signal_time"],
+            "last_signal_bars_ago": BOT_STATE["last_signal_bars_ago"],
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── 진단용: 업비트 /v1/accounts 원본 콜로 HTTP 상태/본문/헤더 보기
+# ── 진단용: 업비트 /v1/accounts 원본 콜(상태/헤더 확인)
 @app.route("/diag")
 def diag():
     try:
@@ -97,7 +100,6 @@ def _mask(s, keep=4):
         return "*" * len(s)
     return s[:keep] + "*" * (len(s) - keep)
 
-# 환경변수 점검 (마스킹만 출력)
 print(f"[ENV] ACCESS_KEY={_mask(ACCESS_KEY)} SECRET_KEY={_mask(SECRET_KEY)} SYMBOL={SYMBOL}")
 
 # -------------------------------
@@ -110,6 +112,9 @@ BOT_STATE = {
     "buy_qty": 0.0,
     "last_error": None,
     "last_trade_time": None,
+    # 신호 알림 중복 방지
+    "last_signal_time": None,
+    "last_signal_bars_ago": None,
 }
 
 # 캐시
@@ -117,7 +122,7 @@ _last_ma_update_ts = 0.0
 _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
 
 _last_gc_update_ts = 0.0
-_cached_gc = {"ok": False, "bars_ago": None}
+_cached_gc = {"ok": None, "bars_ago": None}
 
 # -------------------------------
 # Telegram
@@ -166,10 +171,9 @@ def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid,
         pass
 
 # -------------------------------
-# 업비트 원본 /v1/accounts 호출 (진단)
+# 업비트 /v1/accounts (JWT)
 # -------------------------------
 def call_accounts_raw_with_headers():
-    """JWT로 /v1/accounts를 직접 호출해 상태코드/본문/헤더를 반환."""
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
     payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
@@ -179,13 +183,9 @@ def call_accounts_raw_with_headers():
     return r.status_code, r.text, r.headers
 
 # -------------------------------
-# 레이트리밋 백오프 (공통)
+# Rate-limit backoff
 # -------------------------------
 def backoff_from_headers(headers, base=1.0, max_sleep=10.0):
-    """
-    Remaining-Req: group=default; min=1800; sec=29
-    sec 값이 바닥이면 잠깐 대기. 헤더가 없으면 기본 대기.
-    """
     rem = headers.get("Remaining-Req") if headers else None
     if rem and "sec=" in rem:
         try:
@@ -198,7 +198,7 @@ def backoff_from_headers(headers, base=1.0, max_sleep=10.0):
     time.sleep(base)
 
 # -------------------------------
-# 잔고/시세 유틸 (모두 float로 통일, 재시도 포함)
+# Balances/Price utils
 # -------------------------------
 def _to_float(x):
     try:
@@ -207,10 +207,9 @@ def _to_float(x):
         return None
 
 def get_balance_float(upbit, ticker: str, retry=3, delay=0.8):
-    """pyupbit.get_balance 래퍼: 항상 float 또는 None을 반환."""
     for i in range(retry):
         try:
-            val = upbit.get_balance(ticker)  # 문자열/float/None
+            val = upbit.get_balance(ticker)
             fv = _to_float(val)
             if fv is not None:
                 return fv
@@ -223,7 +222,6 @@ def get_krw_balance_safely(upbit, retry=3, delay=0.8):
     return get_balance_float(upbit, "KRW", retry=retry, delay=delay)
 
 def wait_balance_change(getter_float, before_float, cmp="gt", timeout=20, interval=0.5):
-    """getter_float는 float 또는 None을 반환해야 함."""
     waited = 0.0
     while waited < timeout:
         nowb = None
@@ -277,12 +275,12 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
     return None
 
 # -------------------------------
-# MA & Golden Cross (with caching)
+# MA & Golden Cross (cached)
 # -------------------------------
 def get_ma_values():
     """
     Returns: (ok, last_close, sma_short, sma_long)
-    - last_close, SMA들은 '닫힌 마지막 봉'(iloc[-2] 기준)을 사용하여 리페인트 방지
+    - 리페인트 방지: '닫힌 마지막 봉'(iloc[-2])을 사용
     """
     cnt = max(MA_LONG + 10, 60)
     df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
@@ -296,7 +294,6 @@ def get_ma_values():
     sma_s = float(close.rolling(MA_SHORT).mean().iloc[-2])
     sma_l = float(close.rolling(MA_LONG).mean().iloc[-2])
     last_close = float(close.iloc[-2])  # 직전봉 종가(확정치)
-
     return True, last_close, sma_s, sma_l
 
 def get_ma_values_cached():
@@ -329,10 +326,10 @@ def golden_cross_recent():
     sma_s = close.rolling(MA_SHORT).mean()
     sma_l = close.rolling(MA_LONG).mean()
 
-    # 닫힌 봉 기준으로 검사: i = -2 (직전봉), -3, ... - (CROSS_LOOKBACK+1)
+    # 닫힌 봉 기준: i = -2 (직전봉), -3, ... - (CROSS_LOOKBACK+1)
     for k in range(1, CROSS_LOOKBACK + 1):
-        cur_idx = -1 - k            # 현재 검사 봉(닫힌 봉)
-        prev_idx = cur_idx - 1      # 그 직전 봉
+        cur_idx = -1 - k           # 현재 검사 봉(닫힌 봉)
+        prev_idx = cur_idx - 1     # 바로 이전 봉
         s_prev, l_prev = float(sma_s.iloc[prev_idx]), float(sma_l.iloc[prev_idx])
         s_cur,  l_cur  = float(sma_s.iloc[cur_idx]),  float(sma_l.iloc[cur_idx])
         if s_prev <= l_prev and s_cur > l_cur:
@@ -371,8 +368,7 @@ def market_buy_all(upbit):
             print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
             return None, None, None
 
-        # pyupbit: 시장가 매수 금액은 수수료 제외 금액 → 보수적으로 집행
-        spend = krw_before * 0.9990
+        spend = krw_before * 0.9990  # 수수료 고려 보수적 집행
         r = upbit.buy_market_order(SYMBOL, spend)
         buy_uuid = _extract_uuid(r)
         if buy_uuid is None:
@@ -437,7 +433,7 @@ def run_bot_loop():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY missing")
 
-    # 업비트 초기 진단: /v1/accounts 호출 한 번 (상태/헤더 확인)
+    # 1) 업비트 인증/레이트리밋 진단 1회
     try:
         sc, body, headers = call_accounts_raw_with_headers()
         if sc != 200:
@@ -458,6 +454,11 @@ def run_bot_loop():
     buy_qty   = 0.0
     buy_uuid  = None
 
+    # 신호 알림 중복 방지용 로컬 상태
+    last_alert_bars_ago = None
+    last_alert_ts = 0.0
+    MIN_ALERT_INTERVAL_SEC = 20.0  # 같은 bars_ago라도 최소 20초 간격 두고 알림
+
     while True:
         try:
             price = get_price_safe(SYMBOL)
@@ -465,21 +466,36 @@ def run_bot_loop():
                 time.sleep(2)
                 continue
 
+            # --- Signal detection & alert (once per cross) ---
+            gc_ok, bars_ago = golden_cross_recent_cached()
+            now_ts = time.time()
+            if gc_ok and bars_ago is not None:
+                # 새 신호 판단: bars_ago가 바뀌었거나, 마지막 알림으로부터 충분히 경과
+                is_new_signal = (last_alert_bars_ago != bars_ago) or (now_ts - last_alert_ts >= MIN_ALERT_INTERVAL_SEC)
+                if is_new_signal:
+                    ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
+                    send_telegram(
+                        f"🔔 골든크로스 신호 감지 (최근 {bars_ago}봉 전)\n"
+                        f"last={last_close:.2f}, SMA{MA_SHORT}={sma_s:.2f}, SMA{MA_LONG}={sma_l:.2f}"
+                    )
+                    last_alert_bars_ago = bars_ago
+                    last_alert_ts = now_ts
+                    BOT_STATE["last_signal_time"] = datetime.now().isoformat()
+                    BOT_STATE["last_signal_bars_ago"] = bars_ago
+
             # --- Entry: Golden Cross only ---
             if not bought:
-                gc_ok, bars_ago = golden_cross_recent_cached()
                 if not gc_ok:
-                    # 골든크로스가 최근 N봉 내에 없으면 대기
                     time.sleep(2)
                     continue
 
-                # 골든크로스 발견 → 시장가 전량 매수
+                # 골든크로스 최근 N봉 내 → 시장가 전량 매수
                 avg_buy, qty, buuid = market_buy_all(upbit)
                 if avg_buy is not None and qty and qty > 0:
                     bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
                     BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
                                       "last_trade_time": datetime.now().isoformat()})
-                    send_telegram(f"📥 매수 진입(골든크로스 {bars_ago}봉 전)! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
+                    send_telegram(f"📥 매수 진입! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
                 else:
                     time.sleep(8)
                 continue
@@ -536,8 +552,6 @@ def supervisor():
 # Entrypoint
 # -------------------------------
 if __name__ == "__main__":
-    # 로컬 실행 시 개발서버로 돌림 (Render/운영에선 gunicorn 권장)
     threading.Thread(target=supervisor, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))  # Render 기본 PORT는 10000
     app.run(host="0.0.0.0", port=port)
-
