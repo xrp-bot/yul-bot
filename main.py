@@ -1,9 +1,9 @@
-# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Flask3/Gunicorn-safe start)
-# - Strategy: BUY when SMA_SHORT crosses above SMA_LONG within last N closed candles
-# - Alerts: Telegram on "signal detected" (dedup) + on fills (buy/sell)
+# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Import-time start)
+# - Entry: SMA_SHORT crosses above SMA_LONG within last N closed candles (recent)
+# - Alerts: Telegram on signal detected (dedup) + on fills (buy/sell)
 # - Exit: Take-Profit / Stop-Loss
-# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, rate-limit backoff
-# - Flask 3.x: before_serving 훅으로 백그라운드 루프 1회 자동 시작
+# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, backoff
+# - Start: No Flask hooks; start background loop once at import-time (gunicorn-safe)
 
 import os
 import time
@@ -545,20 +545,20 @@ def supervisor():
             continue
 
 # -------------------------------
-# Flask 3.x: app start hook (once)
+# Import-time start (gunicorn-safe)
 # -------------------------------
-@app.before_serving
-def _start_bot_once():
-    """Gunicorn/Flask3 환경에서도 백그라운드 루프가 반드시 시작되도록 1회만 실행."""
-    if not getattr(app, "_bot_started", False):
-        threading.Thread(target=supervisor, daemon=True).start()
-        app._bot_started = True
-        print("[BOOT] Supervisor thread started via before_serving")
+# 모듈이 임포트될 때 1회만 백그라운드 루프 시작.
+# gunicorn에서 workers=1인 상태라면 정확히 한 번만 실행됩니다.
+if not getattr(app, "_bot_started", False):
+    threading.Thread(target=supervisor, daemon=True).start()
+    app._bot_started = True
+    print("[BOOT] Supervisor thread started at import")
 
 # -------------------------------
 # Entrypoint (local dev)
 # -------------------------------
 if __name__ == "__main__":
+    # 로컬에서 재시작/중복방지
     if not getattr(app, "_bot_started", False):
         threading.Thread(target=supervisor, daemon=True).start()
         app._bot_started = True
