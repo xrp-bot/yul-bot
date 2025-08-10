@@ -1,5 +1,7 @@
-# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Import-time start)
-# - Entry: SMA_SHORT crosses above SMA_LONG within last N closed candles (recent)
+# main.py — Upbit Bot (Golden Cross + Continuation Entry + Signal Alerts + Import-time start)
+# - Entry:
+#   1) Golden Cross: SMA_SHORT crosses above SMA_LONG within last N closed candles (recent)
+#   2) (옵션) Continuation: 최근 교차가 없어도 SMA_SHORT > SMA_LONG이면 진입 (CONTINUATION_ALLOW)
 # - Alerts: Telegram on signal detected (dedup) + on fills (buy/sell)
 # - Exit: Take-Profit / Stop-Loss
 # - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, backoff
@@ -54,6 +56,7 @@ def status():
             "last_signal_time": BOT_STATE["last_signal_time"],
             "last_signal_bars_ago": BOT_STATE["last_signal_bars_ago"],
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "continuation_allow": CONTINUATION_ALLOW,
         }
         return jsonify(data)
     except Exception as e:
@@ -89,6 +92,9 @@ MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
 CROSS_LOOKBACK  = int(os.getenv("CROSS_LOOKBACK", "3"))     # 최근 N개 닫힌 캔들 내 교차 허용
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))    # 캐시 주기
+
+# Continuation entry flag
+CONTINUATION_ALLOW = os.getenv("CONTINUATION_ALLOW", "false").lower() == "true"
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
 
@@ -480,18 +486,36 @@ def run_bot_loop():
                         BOT_STATE["last_signal_time"] = datetime.now().isoformat()
                         BOT_STATE["last_signal_bars_ago"] = bars_ago
 
-            # --- Entry: Golden Cross only ---
+            # --- Entry: Golden Cross OR Continuation (if enabled) ---
             if not bought:
-                if not gc_ok:
+                ok_ma, last_close, s_now, l_now = get_ma_values_cached()
+                allow_entry = False
+                entry_reason = None
+
+                if gc_ok:
+                    allow_entry = True
+                    entry_reason = f"골든크로스 {bars_ago}봉 전"
+                elif CONTINUATION_ALLOW and ok_ma and s_now is not None and l_now is not None and s_now > l_now:
+                    allow_entry = True
+                    entry_reason = f"추세 지속(SMA{MA_SHORT}>{MA_LONG})"
+
+                if not allow_entry:
                     time.sleep(2)
                     continue
+
+                # (옵션) Continuation으로 들어갈 때 신호성 알림
+                if entry_reason and entry_reason.startswith("추세 지속"):
+                    send_telegram(
+                        f"🔔 추세 지속 진입 조건 충족\n"
+                        f"last={last_close:.2f}, SMA{MA_SHORT}={s_now:.2f}, SMA{MA_LONG}={l_now:.2f}"
+                    )
 
                 avg_buy, qty, buuid = market_buy_all(upbit)
                 if avg_buy is not None and qty and qty > 0:
                     bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
                     BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
                                       "last_trade_time": datetime.now().isoformat()})
-                    send_telegram(f"📥 매수 진입! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
+                    send_telegram(f"📥 매수 진입({entry_reason})! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
                 else:
                     time.sleep(8)
                 continue
@@ -548,7 +572,6 @@ def supervisor():
 # Import-time start (gunicorn-safe)
 # -------------------------------
 # 모듈이 임포트될 때 1회만 백그라운드 루프 시작.
-# gunicorn에서 workers=1인 상태라면 정확히 한 번만 실행됩니다.
 if not getattr(app, "_bot_started", False):
     threading.Thread(target=supervisor, daemon=True).start()
     app._bot_started = True
@@ -558,7 +581,6 @@ if not getattr(app, "_bot_started", False):
 # Entrypoint (local dev)
 # -------------------------------
 if __name__ == "__main__":
-    # 로컬에서 재시작/중복방지
     if not getattr(app, "_bot_started", False):
         threading.Thread(target=supervisor, daemon=True).start()
         app._bot_started = True
