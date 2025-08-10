@@ -1,9 +1,9 @@
-# main.py — Upbit Bot (Golden Cross only + Signal Alerts)
+# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Gunicorn-safe start)
 # - Strategy: BUY when SMA_SHORT crosses above SMA_LONG within last N closed candles
-# - Alerts: Telegram on "signal detected" (deduplicated) + on fills (buy/sell)
+# - Alerts: Telegram on "signal detected" (dedup) + on fills (buy/sell)
 # - Exit: Take-Profit / Stop-Loss
 # - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, rate-limit backoff
-# - NOTE: Entry는 오직 골든크로스만 사용. 기존 필터/조건 제거됨.
+# - Gunicorn: before_first_request 훅으로 백그라운드 루프 1회 자동 시작
 
 import os
 import time
@@ -474,14 +474,15 @@ def run_bot_loop():
                 is_new_signal = (last_alert_bars_ago != bars_ago) or (now_ts - last_alert_ts >= MIN_ALERT_INTERVAL_SEC)
                 if is_new_signal:
                     ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
-                    send_telegram(
-                        f"🔔 골든크로스 신호 감지 (최근 {bars_ago}봉 전)\n"
-                        f"last={last_close:.2f}, SMA{MA_SHORT}={sma_s:.2f}, SMA{MA_LONG}={sma_l:.2f}"
-                    )
-                    last_alert_bars_ago = bars_ago
-                    last_alert_ts = now_ts
-                    BOT_STATE["last_signal_time"] = datetime.now().isoformat()
-                    BOT_STATE["last_signal_bars_ago"] = bars_ago
+                    if ok_ma:
+                        send_telegram(
+                            f"🔔 골든크로스 신호 감지 (최근 {bars_ago}봉 전)\n"
+                            f"last={last_close:.2f}, SMA{MA_SHORT}={sma_s:.2f}, SMA{MA_LONG}={sma_l:.2f}"
+                        )
+                        last_alert_bars_ago = bars_ago
+                        last_alert_ts = now_ts
+                        BOT_STATE["last_signal_time"] = datetime.now().isoformat()
+                        BOT_STATE["last_signal_bars_ago"] = bars_ago
 
             # --- Entry: Golden Cross only ---
             if not bought:
@@ -549,9 +550,24 @@ def supervisor():
             continue
 
 # -------------------------------
-# Entrypoint
+# Gunicorn-safe: first request hook
+# -------------------------------
+@app.before_first_request
+def _start_bot_once():
+    """Gunicorn 환경에서도 백그라운드 루프가 반드시 시작되도록 1회만 실행."""
+    if not getattr(app, "_bot_started", False):
+        threading.Thread(target=supervisor, daemon=True).start()
+        app._bot_started = True
+        print("[BOOT] Supervisor thread started via before_first_request")
+
+# -------------------------------
+# Entrypoint (local dev)
 # -------------------------------
 if __name__ == "__main__":
-    threading.Thread(target=supervisor, daemon=True).start()
+    # 로컬 실행 시에도 백그라운드 루프 시작
+    if not getattr(app, "_bot_started", False):
+        threading.Thread(target=supervisor, daemon=True).start()
+        app._bot_started = True
+        print("[BOOT] Supervisor thread started via __main__")
     port = int(os.environ.get("PORT", 10000))  # Render 기본 PORT는 10000
     app.run(host="0.0.0.0", port=port)
