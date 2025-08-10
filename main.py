@@ -1,5 +1,8 @@
-# main.py — Render/Upbit Bot (robust balances, MA filter, /status, /diag+headers, rate-limit backoff, /health)
-# + admin allow toggle, skip-reason telemetry, richer /status
+# main.py — Upbit Bot (Golden Cross only)
+# - Strategy: BUY when SMA_SHORT crosses above SMA_LONG within last N closed candles
+# - EXIT: TP/SL
+# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, rate-limit backoff
+# - NOTE: All previous entry filters are removed; ONLY golden-cross decides entries.
 
 import os
 import time
@@ -30,25 +33,23 @@ def health():
 def status():
     try:
         price = get_price_safe(SYMBOL)
-        ok, last_close, sma_s, sma_l, allow_by_ma = get_ma_signal()
-        # 최종 allow: 관리자 토글 + (필요 시) MA 필터
-        final_allow = (not USE_MA_FILTER or allow_by_ma) and BOT_STATE["admin_allow_buy"]
+        ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
+        gc_ok, bars_ago = golden_cross_recent_cached()
+
         data = {
             "symbol": SYMBOL,
             "price": price,
-            "ma_ok": ok,
+            "ma_ok": ok_ma,
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "allow_by_ma": allow_by_ma,
-            "admin_allow_buy": BOT_STATE["admin_allow_buy"],
-            "allow_buy": final_allow,  # 최종 판정
+            "gc_recent": gc_ok,           # 최근 N봉 내 골든크로스?
+            "gc_bars_ago": bars_ago,      # 몇 봉 전에 발생했는지 (1=직전봉, 2=그 전 봉 ...)
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
             "last_trade_time": BOT_STATE["last_trade_time"],
             "last_error": BOT_STATE["last_error"],
-            "last_reason": BOT_STATE["last_reason"],
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         return jsonify(data)
@@ -68,19 +69,6 @@ def diag():
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ── 관리자 토글: 매수 허용/차단
-@app.route("/enable_buy")
-def enable_buy():
-    BOT_STATE["admin_allow_buy"] = True
-    BOT_STATE["last_reason"] = None
-    return jsonify({"ok": True, "admin_allow_buy": True})
-
-@app.route("/disable_buy")
-def disable_buy():
-    BOT_STATE["admin_allow_buy"] = False
-    BOT_STATE["last_reason"] = "관리자 차단"
-    return jsonify({"ok": True, "admin_allow_buy": False})
-
 # -------------------------------
 # ENV & Strategy Params
 # -------------------------------
@@ -89,15 +77,16 @@ SECRET_KEY       = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL        = os.getenv("SYMBOL", "KRW-XRP")
-PROFIT_RATIO  = float(os.getenv("PROFIT_RATIO", "0.03"))  # +3% 익절
-LOSS_RATIO    = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1% 손절
+SYMBOL          = os.getenv("SYMBOL", "KRW-XRP")
+PROFIT_RATIO    = float(os.getenv("PROFIT_RATIO", "0.03"))  # +3% 익절
+LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1% 손절
 
-USE_MA_FILTER   = os.getenv("USE_MA_FILTER", "true").lower() == "true"
+# Golden Cross parameters
 MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")
 MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
-MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))  # 호출 줄이기
+CROSS_LOOKBACK  = int(os.getenv("CROSS_LOOKBACK", "3"))     # 최근 N개 "닫힌" 캔들 내 교차 허용
+MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))    # MA/시그널 캐시 주기
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
 
@@ -121,13 +110,14 @@ BOT_STATE = {
     "buy_qty": 0.0,
     "last_error": None,
     "last_trade_time": None,
-    "last_reason": None,           # ⬅️ 스킵 사유/차단 사유
-    "admin_allow_buy": True,       # ⬅️ 관리자 토글 (기본 허용)
 }
 
-# MA 캐시
+# 캐시
 _last_ma_update_ts = 0.0
 _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
+
+_last_gc_update_ts = 0.0
+_cached_gc = {"ok": False, "bars_ago": None}
 
 # -------------------------------
 # Telegram
@@ -153,14 +143,6 @@ def send_telegram(msg: str):
         loop.run_until_complete(_send_telegram_async(msg))
         loop.close()
 
-def set_reason(reason: str, also_telegram=False):
-    BOT_STATE["last_reason"] = reason
-    if also_telegram:
-        try:
-            send_telegram(f"❗️스킵: {reason}")
-        except Exception:
-            pass
-
 # -------------------------------
 # CSV 저장 (체결내역)
 # -------------------------------
@@ -178,7 +160,6 @@ def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid,
             ts, side, f"{qty:.6f}", f"{avg_price:.6f}",
             f"{realized_krw:.2f}", f"{pnl_pct:.2f}", buy_uuid or "", sell_uuid or ""
         ])
-    # 선택: 텔레그램 백업 로그
     try:
         send_telegram(f"[LOG] {ts} {side} qty={qty:.6f} avg={avg_price:.2f} PnL₩={realized_krw:.0f}({pnl_pct:.2f}%)")
     except Exception:
@@ -196,7 +177,6 @@ def call_accounts_raw_with_headers():
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
     return r.status_code, r.text, r.headers
-# Upbit는 JWT 인증 + Remaining-Req 헤더로 레이트리밋을 제공합니다.
 
 # -------------------------------
 # 레이트리밋 백오프 (공통)
@@ -297,52 +277,77 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
     return None
 
 # -------------------------------
-# MA Signal (캐시)
+# MA & Golden Cross (with caching)
 # -------------------------------
-def get_ma_signal():
+def get_ma_values():
     """
-    return: (ok, last_close, sma_short, sma_long, allow_by_ma)
-    allow_by_ma: (last > SMA_short) and (SMA_short > SMA_long)
+    Returns: (ok, last_close, sma_short, sma_long)
+    - last_close, SMA들은 '닫힌 마지막 봉'(iloc[-2] 기준)을 사용하여 리페인트 방지
     """
-    global _last_ma_update_ts, _cached_ma
+    cnt = max(MA_LONG + 10, 60)
+    df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
+    if df is None or df.empty or "close" not in df.columns:
+        return False, None, None, None
 
+    close = df["close"]
+    if len(close) < MA_LONG + 2:
+        return False, None, None, None
+
+    sma_s = float(close.rolling(MA_SHORT).mean().iloc[-2])
+    sma_l = float(close.rolling(MA_LONG).mean().iloc[-2])
+    last_close = float(close.iloc[-2])  # 직전봉 종가(확정치)
+
+    return True, last_close, sma_s, sma_l
+
+def get_ma_values_cached():
+    global _last_ma_update_ts, _cached_ma
     now_ts = time.time()
     if now_ts - _last_ma_update_ts < MA_REFRESH_SEC and _cached_ma["ok"]:
         c = _cached_ma
-        allow = (c["close"] is not None and c["sma_s"] is not None and c["sma_l"] is not None
-                 and c["close"] > c["sma_s"] > c["sma_l"])
-        return True, c["close"], c["sma_s"], c["sma_l"], allow
+        return True, c["close"], c["sma_s"], c["sma_l"]
+    ok, last_close, sma_s, sma_l = get_ma_values()
+    _cached_ma = {"ok": ok, "close": last_close, "sma_s": sma_s, "sma_l": sma_l}
+    _last_ma_update_ts = now_ts
+    return ok, last_close, sma_s, sma_l
 
-    try:
-        cnt = max(MA_LONG + 5, 30)
-        df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
-        if df is None or df.empty or "close" not in df.columns:
-            _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
-            _last_ma_update_ts = now_ts
-            return False, None, None, None, False
+def golden_cross_recent():
+    """
+    최근 CROSS_LOOKBACK 개의 '닫힌 캔들' 내에서
+    SMA_SHORT가 SMA_LONG을 상향 돌파했는지 검사.
+    Returns: (gc_ok, bars_ago)
+      - bars_ago: 1이면 직전봉에서 교차, 2면 그 전 봉, ...
+    """
+    cnt = max(MA_LONG + CROSS_LOOKBACK + 5, 80)
+    df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
+    if df is None or df.empty or "close" not in df.columns:
+        return False, None
 
-        close = df["close"]
-        if len(close) < MA_LONG:
-            _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
-            _last_ma_update_ts = now_ts
-            return False, None, None, None, False
+    close = df["close"]
+    if len(close) < MA_LONG + CROSS_LOOKBACK + 2:
+        return False, None
 
-        sma_s = float(close.rolling(MA_SHORT).mean().iloc[-1])
-        sma_l = float(close.rolling(MA_LONG).mean().iloc[-1])
-        last_close = float(close.iloc[-1])
+    sma_s = close.rolling(MA_SHORT).mean()
+    sma_l = close.rolling(MA_LONG).mean()
 
-        _cached_ma = {"ok": True, "close": last_close, "sma_s": sma_s, "sma_l": sma_l}
-        _last_ma_update_ts = now_ts
+    # 닫힌 봉 기준으로 검사: i = -2 (직전봉), -3, ... - (CROSS_LOOKBACK+1)
+    for k in range(1, CROSS_LOOKBACK + 1):
+        cur_idx = -1 - k            # 현재 검사 봉(닫힌 봉)
+        prev_idx = cur_idx - 1      # 그 직전 봉
+        s_prev, l_prev = float(sma_s.iloc[prev_idx]), float(sma_l.iloc[prev_idx])
+        s_cur,  l_cur  = float(sma_s.iloc[cur_idx]),  float(sma_l.iloc[cur_idx])
+        if s_prev <= l_prev and s_cur > l_cur:
+            return True, k
+    return False, None
 
-        allow = (last_close > sma_s) and (sma_s > sma_l)
-        print(f"[MA] last={last_close:.4f}, SMA{MA_SHORT}={sma_s:.4f}, SMA{MA_LONG}={sma_l:.4f}, allow_by_ma={allow}")
-        return True, last_close, sma_s, sma_l, allow
-
-    except Exception:
-        print(f"[MA 예외]\n{traceback.format_exc()}")
-        _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
-        _last_ma_update_ts = time.time()
-        return False, None, None, None, False
+def golden_cross_recent_cached():
+    global _last_gc_update_ts, _cached_gc
+    now_ts = time.time()
+    if now_ts - _last_gc_update_ts < MA_REFRESH_SEC and _cached_gc["ok"] is not None:
+        return _cached_gc["ok"], _cached_gc["bars_ago"]
+    ok, bars_ago = golden_cross_recent()
+    _cached_gc = {"ok": ok, "bars_ago": bars_ago}
+    _last_gc_update_ts = now_ts
+    return ok, bars_ago
 
 # -------------------------------
 # 주문 응답 방어
@@ -364,7 +369,6 @@ def market_buy_all(upbit):
         xrp_before = get_balance_float(upbit, "XRP")
         if krw_before is None or krw_before <= 5000:
             print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
-            set_reason(f"최소주문금액 미만 또는 KRW 조회 실패 (krw={krw_before})", also_telegram=True)
             return None, None, None
 
         # pyupbit: 시장가 매수 금액은 수수료 제외 금액 → 보수적으로 집행
@@ -373,7 +377,6 @@ def market_buy_all(upbit):
         buy_uuid = _extract_uuid(r)
         if buy_uuid is None:
             print("[BUY] 주문 실패 응답:", r)
-            set_reason(f"주문 실패 응답: {r}", also_telegram=True)
             return None, None, None
         print(f"[BUY] 주문 전송 - KRW 사용 예정: {spend:.2f}, uuid={buy_uuid}")
 
@@ -381,7 +384,6 @@ def market_buy_all(upbit):
                                         xrp_before, cmp="gt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[BUY] 체결 확인 실패 (타임아웃)")
-            set_reason("매수 체결 확인 실패(타임아웃)", also_telegram=True)
             return None, None, buy_uuid
 
         filled = xrp_after - xrp_before
@@ -393,7 +395,6 @@ def market_buy_all(upbit):
     except Exception:
         print(f"[BUY 예외]\n{traceback.format_exc()}")
         BOT_STATE["last_error"] = f"BUY: {traceback.format_exc()}"
-        set_reason("매수 예외 발생", also_telegram=True)
         return None, None, None
 
 def market_sell_all(upbit):
@@ -402,14 +403,12 @@ def market_sell_all(upbit):
         krw_before = get_krw_balance_safely(upbit)
         if xrp_before is None or xrp_before <= 0:
             print("[SELL] XRP 부족 또는 조회 실패:", xrp_before)
-            set_reason(f"보유수량 부족/조회 실패 (xrp={xrp_before})", also_telegram=True)
             return None, None, None, None
 
         r = upbit.sell_market_order(SYMBOL, xrp_before)
         sell_uuid = _extract_uuid(r)
         if sell_uuid is None:
             print("[SELL] 주문 실패 응답:", r)
-            set_reason(f"매도 주문 실패 응답: {r}", also_telegram=True)
             return None, None, None, None
         print(f"[SELL] 주문 전송 - qty={xrp_before:.6f}, uuid={sell_uuid}")
 
@@ -417,7 +416,6 @@ def market_sell_all(upbit):
                                         xrp_before, cmp="lt", timeout=30, interval=0.6)
         if xrp_after is None:
             print("[SELL] 체결 확인 실패 (타임아웃)")
-            set_reason("매도 체결 확인 실패(타임아웃)", also_telegram=True)
             return None, None, None, sell_uuid
 
         filled = xrp_before - xrp_after
@@ -430,7 +428,6 @@ def market_sell_all(upbit):
     except Exception:
         print(f"[SELL 예외]\n{traceback.format_exc()}")
         BOT_STATE["last_error"] = f"SELL: {traceback.format_exc()}"
-        set_reason("매도 예외 발생", also_telegram=True)
         return None, None, None, None
 
 # -------------------------------
@@ -465,48 +462,29 @@ def run_bot_loop():
         try:
             price = get_price_safe(SYMBOL)
             if price is None:
-                set_reason("시세 조회 실패(None)", also_telegram=False)
                 time.sleep(2)
                 continue
 
-            # 미보유 → 매수 판단
+            # --- Entry: Golden Cross only ---
             if not bought:
-                # 관리자 차단 여부 먼저 확인
-                if not BOT_STATE["admin_allow_buy"]:
-                    set_reason("관리자 차단(admin_allow_buy=False)", also_telegram=False)
+                gc_ok, bars_ago = golden_cross_recent_cached()
+                if not gc_ok:
+                    # 골든크로스가 최근 N봉 내에 없으면 대기
                     time.sleep(2)
                     continue
 
-                allow = True
-                allow_by_ma = True
-                if USE_MA_FILTER:
-                    ok, last, s, l, allow_by_ma = get_ma_signal()
-                    if not ok:
-                        set_reason("MA 데이터 부족/조회 실패", also_telegram=False)
-                        time.sleep(2)
-                        continue
-                    if not allow_by_ma:
-                        set_reason(f"MA 필터 차단 (last={last:.2f}, s={s:.2f}, l={l:.2f})", also_telegram=False)
-                        time.sleep(2)
-                        continue
-                    allow = allow_by_ma
-
-                if allow:
-                    avg_buy, qty, buuid = market_buy_all(upbit)
-                    if avg_buy is not None and qty and qty > 0:
-                        bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
-                        BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
-                                          "last_trade_time": datetime.now().isoformat(), "last_reason": None})
-                        send_telegram(f"📥 매수 진입! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
-                    else:
-                        # 실패 사유는 market_buy_all에서 last_reason으로 기록됨
-                        time.sleep(10)
+                # 골든크로스 발견 → 시장가 전량 매수
+                avg_buy, qty, buuid = market_buy_all(upbit)
+                if avg_buy is not None and qty and qty > 0:
+                    bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
+                    BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
+                                      "last_trade_time": datetime.now().isoformat()})
+                    send_telegram(f"📥 매수 진입(골든크로스 {bars_ago}봉 전)! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
                 else:
-                    set_reason("내부 allow=False (예상치 못한 분기)", also_telegram=False)
-                    time.sleep(2)
+                    time.sleep(8)
                 continue
 
-            # 보유 중 → 익절/손절
+            # --- Exit: TP/SL ---
             tp = buy_price * (1 + PROFIT_RATIO)
             sl = buy_price * (1 - LOSS_RATIO)
 
@@ -529,20 +507,18 @@ def run_bot_loop():
                     )
                     bought, buy_price, buy_qty, buy_uuid = False, 0.0, 0.0, None
                     BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
-                                      "last_trade_time": datetime.now().isoformat(), "last_reason": None})
+                                      "last_trade_time": datetime.now().isoformat()})
                 else:
                     time.sleep(8)
 
         except TypeError:
             print(f"[❗TypeError]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "TypeError in loop"
-            set_reason("TypeError in loop", also_telegram=False)
             time.sleep(3)
 
         except Exception:
             print(f"[❗루프 예외]\n{traceback.format_exc()}")
             BOT_STATE["last_error"] = "Loop Exception"
-            set_reason("Loop Exception", also_telegram=True)
             raise
 
         time.sleep(2)
@@ -564,3 +540,4 @@ if __name__ == "__main__":
     threading.Thread(target=supervisor, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))  # Render 기본 PORT는 10000
     app.run(host="0.0.0.0", port=port)
+
