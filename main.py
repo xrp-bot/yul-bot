@@ -1,9 +1,9 @@
-# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Gunicorn-safe start)
+# main.py — Upbit Bot (Golden Cross only + Signal Alerts + Flask3/Gunicorn-safe start)
 # - Strategy: BUY when SMA_SHORT crosses above SMA_LONG within last N closed candles
 # - Alerts: Telegram on "signal detected" (dedup) + on fills (buy/sell)
 # - Exit: Take-Profit / Stop-Loss
 # - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, rate-limit backoff
-# - Gunicorn: before_first_request 훅으로 백그라운드 루프 1회 자동 시작
+# - Flask 3.x: before_serving 훅으로 백그라운드 루프 1회 자동 시작
 
 import os
 import time
@@ -44,8 +44,8 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "gc_recent": gc_ok,                 # 최근 N봉 내 골든크로스?
-            "gc_bars_ago": bars_ago,            # 1=직전봉, 2=그 전 봉 ...
+            "gc_recent": gc_ok,
+            "gc_bars_ago": bars_ago,
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
@@ -59,7 +59,6 @@ def status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── 진단용: 업비트 /v1/accounts 원본 콜(상태/헤더 확인)
 @app.route("/diag")
 def diag():
     try:
@@ -88,8 +87,8 @@ LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1% 손절
 MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")
 MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
-CROSS_LOOKBACK  = int(os.getenv("CROSS_LOOKBACK", "3"))     # 최근 N개 "닫힌" 캔들 내 교차 허용
-MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))    # MA/시그널 캐시 주기
+CROSS_LOOKBACK  = int(os.getenv("CROSS_LOOKBACK", "3"))     # 최근 N개 닫힌 캔들 내 교차 허용
+MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))    # 캐시 주기
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
 
@@ -112,7 +111,6 @@ BOT_STATE = {
     "buy_qty": 0.0,
     "last_error": None,
     "last_trade_time": None,
-    # 신호 알림 중복 방지
     "last_signal_time": None,
     "last_signal_bars_ago": None,
 }
@@ -280,7 +278,7 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
 def get_ma_values():
     """
     Returns: (ok, last_close, sma_short, sma_long)
-    - 리페인트 방지: '닫힌 마지막 봉'(iloc[-2])을 사용
+    - 리페인트 방지: 닫힌 마지막 봉(iloc[-2]) 사용
     """
     cnt = max(MA_LONG + 10, 60)
     df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
@@ -293,7 +291,7 @@ def get_ma_values():
 
     sma_s = float(close.rolling(MA_SHORT).mean().iloc[-2])
     sma_l = float(close.rolling(MA_LONG).mean().iloc[-2])
-    last_close = float(close.iloc[-2])  # 직전봉 종가(확정치)
+    last_close = float(close.iloc[-2])  # 직전봉 종가(확정)
     return True, last_close, sma_s, sma_l
 
 def get_ma_values_cached():
@@ -309,10 +307,9 @@ def get_ma_values_cached():
 
 def golden_cross_recent():
     """
-    최근 CROSS_LOOKBACK 개의 '닫힌 캔들' 내에서
+    최근 CROSS_LOOKBACK 개 닫힌 캔들 내에서
     SMA_SHORT가 SMA_LONG을 상향 돌파했는지 검사.
-    Returns: (gc_ok, bars_ago)
-      - bars_ago: 1이면 직전봉에서 교차, 2면 그 전 봉, ...
+    Returns: (gc_ok, bars_ago) — bars_ago: 1=직전봉, 2=그 전 봉, ...
     """
     cnt = max(MA_LONG + CROSS_LOOKBACK + 5, 80)
     df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
@@ -326,10 +323,10 @@ def golden_cross_recent():
     sma_s = close.rolling(MA_SHORT).mean()
     sma_l = close.rolling(MA_LONG).mean()
 
-    # 닫힌 봉 기준: i = -2 (직전봉), -3, ... - (CROSS_LOOKBACK+1)
+    # 닫힌 봉 기준: -2(직전), -3, ... -(CROSS_LOOKBACK+1)
     for k in range(1, CROSS_LOOKBACK + 1):
-        cur_idx = -1 - k           # 현재 검사 봉(닫힌 봉)
-        prev_idx = cur_idx - 1     # 바로 이전 봉
+        cur_idx = -1 - k
+        prev_idx = cur_idx - 1
         s_prev, l_prev = float(sma_s.iloc[prev_idx]), float(sma_l.iloc[prev_idx])
         s_cur,  l_cur  = float(sma_s.iloc[cur_idx]),  float(sma_l.iloc[cur_idx])
         if s_prev <= l_prev and s_cur > l_cur:
@@ -454,10 +451,10 @@ def run_bot_loop():
     buy_qty   = 0.0
     buy_uuid  = None
 
-    # 신호 알림 중복 방지용 로컬 상태
+    # 신호 알림 중복 방지 로컬 상태
     last_alert_bars_ago = None
     last_alert_ts = 0.0
-    MIN_ALERT_INTERVAL_SEC = 20.0  # 같은 bars_ago라도 최소 20초 간격 두고 알림
+    MIN_ALERT_INTERVAL_SEC = 20.0
 
     while True:
         try:
@@ -466,11 +463,10 @@ def run_bot_loop():
                 time.sleep(2)
                 continue
 
-            # --- Signal detection & alert (once per cross) ---
+            # --- Signal detection & alert (dedup) ---
             gc_ok, bars_ago = golden_cross_recent_cached()
             now_ts = time.time()
             if gc_ok and bars_ago is not None:
-                # 새 신호 판단: bars_ago가 바뀌었거나, 마지막 알림으로부터 충분히 경과
                 is_new_signal = (last_alert_bars_ago != bars_ago) or (now_ts - last_alert_ts >= MIN_ALERT_INTERVAL_SEC)
                 if is_new_signal:
                     ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
@@ -490,7 +486,6 @@ def run_bot_loop():
                     time.sleep(2)
                     continue
 
-                # 골든크로스 최근 N봉 내 → 시장가 전량 매수
                 avg_buy, qty, buuid = market_buy_all(upbit)
                 if avg_buy is not None and qty and qty > 0:
                     bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
@@ -550,21 +545,20 @@ def supervisor():
             continue
 
 # -------------------------------
-# Gunicorn-safe: first request hook
+# Flask 3.x: app start hook (once)
 # -------------------------------
-@app.before_first_request
+@app.before_serving
 def _start_bot_once():
-    """Gunicorn 환경에서도 백그라운드 루프가 반드시 시작되도록 1회만 실행."""
+    """Gunicorn/Flask3 환경에서도 백그라운드 루프가 반드시 시작되도록 1회만 실행."""
     if not getattr(app, "_bot_started", False):
         threading.Thread(target=supervisor, daemon=True).start()
         app._bot_started = True
-        print("[BOOT] Supervisor thread started via before_first_request")
+        print("[BOOT] Supervisor thread started via before_serving")
 
 # -------------------------------
 # Entrypoint (local dev)
 # -------------------------------
 if __name__ == "__main__":
-    # 로컬 실행 시에도 백그라운드 루프 시작
     if not getattr(app, "_bot_started", False):
         threading.Thread(target=supervisor, daemon=True).start()
         app._bot_started = True
