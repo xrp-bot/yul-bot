@@ -1,11 +1,8 @@
-# main.py — Upbit Bot (Golden Cross + Continuation Entry + Signal Alerts + Import-time start)
-# - Entry:
-#   1) Golden Cross: SMA_SHORT crosses above SMA_LONG within last N closed candles (recent)
-#   2) (옵션) Continuation: 최근 교차가 없어도 SMA_SHORT > SMA_LONG이면 진입 (CONTINUATION_ALLOW)
-# - Alerts: Telegram on signal detected (dedup) + on fills (buy/sell)
-# - Exit: Take-Profit / Stop-Loss
-# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, backoff
-# - Start: No Flask hooks; start background loop once at import-time (gunicorn-safe)
+# main.py — Upbit Bot (Rebound Entry + Daily 9AM Report + Signal Alerts)
+# - Entry (NEW): 바닥 반등 초입(연속 양봉 + 단기MA 꺾임 + 거래량 증가)
+# - Exit: TP/SL
+# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, 9AM Daily Report
+# - Start: Import-time background threads (bot + report) — gunicorn-safe
 
 import os
 import time
@@ -16,8 +13,15 @@ import asyncio
 import traceback
 import uuid
 import jwt
-from datetime import datetime
+import csv
+from datetime import datetime, timedelta
 from flask import Flask, jsonify
+
+# Python 3.9+ 표준 타임존
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 # -------------------------------
 # Flask
@@ -37,7 +41,6 @@ def status():
     try:
         price = get_price_safe(SYMBOL)
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
-        gc_ok, bars_ago = golden_cross_recent_cached()
 
         data = {
             "symbol": SYMBOL,
@@ -46,17 +49,29 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "gc_recent": gc_ok,
-            "gc_bars_ago": bars_ago,
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
             "last_trade_time": BOT_STATE["last_trade_time"],
             "last_error": BOT_STATE["last_error"],
             "last_signal_time": BOT_STATE["last_signal_time"],
-            "last_signal_bars_ago": BOT_STATE["last_signal_bars_ago"],
+            "last_signal_reason": BOT_STATE.get("last_signal_reason"),
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "continuation_allow": CONTINUATION_ALLOW,
+            "entry_params": {
+                "BULL_COUNT": BULL_COUNT,
+                "VOL_MA": VOL_MA,
+                "VOL_BOOST": VOL_BOOST,
+                "INFLECT_REQUIRE": INFLECT_REQUIRE,
+                "DOWN_BARS": DOWN_BARS,
+                "SWING_LOOKBACK": SWING_LOOKBACK,
+                "BREAK_PREVHIGH": BREAK_PREVHIGH,
+                "MA_INTERVAL": MA_INTERVAL,
+            },
+            "report": {
+                "tz": REPORT_TZ,
+                "hour": REPORT_HOUR,
+                "minute": REPORT_MINUTE,
+            }
         }
         return jsonify(data)
     except Exception as e:
@@ -86,17 +101,27 @@ SYMBOL          = os.getenv("SYMBOL", "KRW-XRP")
 PROFIT_RATIO    = float(os.getenv("PROFIT_RATIO", "0.03"))  # +3% 익절
 LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1% 손절
 
-# Golden Cross parameters
-MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute5")
+# MA/Interval
+MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute1")  # 1분봉 권장
 MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
-CROSS_LOOKBACK  = int(os.getenv("CROSS_LOOKBACK", "3"))     # 최근 N개 닫힌 캔들 내 교차 허용
-MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))    # 캐시 주기
-
-# Continuation entry flag
-CONTINUATION_ALLOW = os.getenv("CONTINUATION_ALLOW", "false").lower() == "true"
+MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "60"))
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
+
+# --- NEW: Rebound entry tuning params ---
+BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))          # 연속 양봉 개수
+VOL_MA          = int(os.getenv("VOL_MA", "20"))             # 거래량 이동평균 길이
+VOL_BOOST       = float(os.getenv("VOL_BOOST", "1.10"))      # 거래량 증폭 배율
+INFLECT_REQUIRE = os.getenv("INFLECT_REQUIRE", "true").lower() == "true"  # 단기MA 꺾임 강제
+DOWN_BARS       = int(os.getenv("DOWN_BARS", "6"))           # 진입 전 하락 구간 길이
+SWING_LOOKBACK  = int(os.getenv("SWING_LOOKBACK", "12"))     # 스윙저점 탐색 구간
+BREAK_PREVHIGH  = os.getenv("BREAK_PREVHIGH", "true").lower() == "true"   # 직전봉 고가 돌파 요구
+
+# --- NEW: Daily report params ---
+REPORT_TZ      = os.getenv("REPORT_TZ", "Asia/Seoul")
+REPORT_HOUR    = int(os.getenv("REPORT_HOUR", "9"))
+REPORT_MINUTE  = int(os.getenv("REPORT_MINUTE", "0"))
 
 def _mask(s, keep=4):
     if not s:
@@ -118,15 +143,12 @@ BOT_STATE = {
     "last_error": None,
     "last_trade_time": None,
     "last_signal_time": None,
-    "last_signal_bars_ago": None,
+    "last_signal_reason": None,
 }
 
 # 캐시
 _last_ma_update_ts = 0.0
 _cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
-
-_last_gc_update_ts = 0.0
-_cached_gc = {"ok": None, "bars_ago": None}
 
 # -------------------------------
 # Telegram
@@ -156,7 +178,6 @@ def send_telegram(msg: str):
 # CSV 저장 (체결내역)
 # -------------------------------
 def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid, ts):
-    import csv
     file_exists = os.path.isfile(CSV_FILE)
     with open(CSV_FILE, mode='a', newline='') as f:
         w = csv.writer(f)
@@ -279,25 +300,22 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
     return None
 
 # -------------------------------
-# MA & Golden Cross (cached)
+# MA (cached) — 닫힌 봉 기준
 # -------------------------------
+_last_ma_update_ts = 0.0
+_cached_ma = {"ok": False, "close": None, "sma_s": None, "sma_l": None}
+
 def get_ma_values():
-    """
-    Returns: (ok, last_close, sma_short, sma_long)
-    - 리페인트 방지: 닫힌 마지막 봉(iloc[-2]) 사용
-    """
     cnt = max(MA_LONG + 10, 60)
     df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
     if df is None or df.empty or "close" not in df.columns:
         return False, None, None, None
-
     close = df["close"]
     if len(close) < MA_LONG + 2:
         return False, None, None, None
-
     sma_s = float(close.rolling(MA_SHORT).mean().iloc[-2])
     sma_l = float(close.rolling(MA_LONG).mean().iloc[-2])
-    last_close = float(close.iloc[-2])  # 직전봉 종가(확정)
+    last_close = float(close.iloc[-2])
     return True, last_close, sma_s, sma_l
 
 def get_ma_values_cached():
@@ -311,43 +329,68 @@ def get_ma_values_cached():
     _last_ma_update_ts = now_ts
     return ok, last_close, sma_s, sma_l
 
-def golden_cross_recent():
+# -------------------------------
+# NEW: 바닥 반등 초입 신호
+# -------------------------------
+def bullish_rebound_signal(symbol, interval):
     """
-    최근 CROSS_LOOKBACK 개 닫힌 캔들 내에서
-    SMA_SHORT가 SMA_LONG을 상향 돌파했는지 검사.
-    Returns: (gc_ok, bars_ago) — bars_ago: 1=직전봉, 2=그 전 봉, ...
+    '바닥 반등 초입' 포착:
+      A) 직전 하락 추세: 최근 DOWN_BARS개 닫힌봉 구간에서 SMA_SHORT <= SMA_LONG 다수
+      B) 스윙저점: 최근 SWING_LOOKBACK 내 최저가가 직전 닫힌봉(-2) 부근
+      C) 전환봉: 양봉 && (옵션) 직전봉 고가 돌파
+      D) 단기MA 꺾임(상향 전환)
+      E) 거래량 증가: vol[-2] > MA(VOL_MA)*VOL_BOOST
     """
-    cnt = max(MA_LONG + CROSS_LOOKBACK + 5, 80)
-    df = get_ohlcv_safe(SYMBOL, interval=MA_INTERVAL, count=cnt)
-    if df is None or df.empty or "close" not in df.columns:
-        return False, None
+    cnt = max(MA_LONG + VOL_MA + SWING_LOOKBACK + 10, 160)
+    df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
+    if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, SWING_LOOKBACK) + 5:
+        return False, "df insufficient"
 
-    close = df["close"]
-    if len(close) < MA_LONG + CROSS_LOOKBACK + 2:
-        return False, None
+    close = df["close"]; open_ = df["open"]; high = df["high"]; low = df["low"]; vol = df["volume"]
 
-    sma_s = close.rolling(MA_SHORT).mean()
-    sma_l = close.rolling(MA_LONG).mean()
+    sma_s_full = close.rolling(MA_SHORT).mean()
+    sma_l_full = close.rolling(MA_LONG).mean()
+    s_m2 = float(sma_s_full.iloc[-2]); s_m3 = float(sma_s_full.iloc[-3]); s_m4 = float(sma_s_full.iloc[-4])
+    l_m2 = float(sma_l_full.iloc[-2]); l_m3 = float(sma_l_full.iloc[-3])
 
-    # 닫힌 봉 기준: -2(직전), -3, ... -(CROSS_LOOKBACK+1)
-    for k in range(1, CROSS_LOOKBACK + 1):
-        cur_idx = -1 - k
-        prev_idx = cur_idx - 1
-        s_prev, l_prev = float(sma_s.iloc[prev_idx]), float(sma_l.iloc[prev_idx])
-        s_cur,  l_cur  = float(sma_s.iloc[cur_idx]),  float(sma_l.iloc[cur_idx])
-        if s_prev <= l_prev and s_cur > l_cur:
-            return True, k
-    return False, None
+    rng = range(-2 - DOWN_BARS + 1, -1)
+    down_cnt = sum(1 for i in rng if float(sma_s_full.iloc[i]) <= float(sma_l_full.iloc[i]))
+    if down_cnt < max(2, DOWN_BARS - 1):
+        return False, f"not enough prior downtrend ({down_cnt}/{DOWN_BARS})"
 
-def golden_cross_recent_cached():
-    global _last_gc_update_ts, _cached_gc
-    now_ts = time.time()
-    if now_ts - _last_gc_update_ts < MA_REFRESH_SEC and _cached_gc["ok"] is not None:
-        return _cached_gc["ok"], _cached_gc["bars_ago"]
-    ok, bars_ago = golden_cross_recent()
-    _cached_gc = {"ok": ok, "bars_ago": bars_ago}
-    _last_gc_update_ts = now_ts
-    return ok, bars_ago
+    look_low = float(low.iloc[-SWING_LOOKBACK-2:-2].min())
+    is_swing_low = abs(float(low.iloc[-2]) - look_low) <= max(1e-8, look_low*0.0015)  # 0.15%
+    if not is_swing_low:
+        return False, "no swing low at -2"
+
+    bull_now = float(close.iloc[-2]) > float(open_.iloc[-2])
+    if not bull_now:
+        return False, "last candle not bullish"
+    if BREAK_PREVHIGH and not (float(close.iloc[-2]) > float(high.iloc[-3])):
+        return False, "no break of prev high"
+
+    if BULL_COUNT >= 2:
+        ok_bulls = True
+        for k in range(1, BULL_COUNT + 1):
+            row = df.iloc[-1 - k]
+            if not (float(row["close"]) > float(row["open"])):
+                ok_bulls = False
+                break
+        if not ok_bulls:
+            return False, f"need {BULL_COUNT} bullish candles"
+
+    turning_up = (s_m2 > s_m3) and (s_m3 <= s_m4) if INFLECT_REQUIRE else (s_m2 > s_m3)
+    if not turning_up:
+        return False, "short MA not turning up"
+
+    vol_ma = float(vol.rolling(VOL_MA).mean().iloc[-2])
+    vol_now = float(vol.iloc[-2])
+    if not (vol_now > vol_ma * VOL_BOOST):
+        return False, f"volume not boosted ({vol_now:.0f} <= {(vol_ma*VOL_BOOST):.0f})"
+
+    why = (f"downtrend={down_cnt}/{DOWN_BARS}, swingLow, breakHigh={BREAK_PREVHIGH}, "
+           f"MA turn up, vol↑ {vol_now:.0f}>{(vol_ma*VOL_BOOST):.0f}")
+    return True, why
 
 # -------------------------------
 # 주문 응답 방어
@@ -430,13 +473,137 @@ def market_sell_all(upbit):
         return None, None, None, None
 
 # -------------------------------
+# Daily 9AM Report
+# -------------------------------
+def _tznow():
+    if ZoneInfo:
+        try:
+            return datetime.now(ZoneInfo(REPORT_TZ))
+        except Exception:
+            pass
+    return datetime.now()
+
+def _read_csv_rows():
+    if not os.path.exists(CSV_FILE):
+        return []
+    rows = []
+    with open(CSV_FILE, newline='') as f:
+        r = csv.DictReader(f)
+        for row in r:
+            rows.append(row)
+    return rows
+
+def _flt(x, default=0.0):
+    try:
+        return float(str(x).replace(',', ''))
+    except Exception:
+        return default
+
+def summarize_trades(date_str=None):
+    """
+    date_str: 'YYYY-MM-DD' (해당 일자만), None이면 전체
+    returns dict
+    """
+    rows = _read_csv_rows()
+    if not rows:
+        return {
+            "count": 0, "wins": 0, "losses": 0,
+            "realized_krw": 0.0, "avg_pnl_pct": 0.0, "winrate": 0.0
+        }
+    filt = []
+    for row in rows:
+        ts = row.get("시간", "")
+        day = ts[:10] if len(ts) >= 10 else ""
+        if (date_str is None) or (day == date_str):
+            filt.append(row)
+    if not filt:
+        return {
+            "count": 0, "wins": 0, "losses": 0,
+            "realized_krw": 0.0, "avg_pnl_pct": 0.0, "winrate": 0.0
+        }
+
+    cnt = len(filt)
+    wins = sum(1 for r in filt if "익절" in r.get("구분(익절/손절)", ""))
+    losses = sum(1 for r in filt if "손절" in r.get("구분(익절/손절)", ""))
+    realized = sum(_flt(r.get("실현손익(원)", 0)) for r in filt)
+    avg_pct = sum(_flt(r.get("손익률(%)", 0)) for r in filt) / cnt if cnt else 0.0
+    winrate = (wins / cnt * 100.0) if cnt else 0.0
+
+    return {
+        "count": cnt, "wins": wins, "losses": losses,
+        "realized_krw": realized, "avg_pnl_pct": avg_pct, "winrate": winrate
+    }
+
+def build_daily_report():
+    now = _tznow()
+    today = now.date().strftime("%Y-%m-%d")
+    yesterday = (now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    d_tot = summarize_trades(today)
+    y_tot = summarize_trades(yesterday)
+    all_tot = summarize_trades(None)
+
+    # 현재 포지션 요약
+    price = get_price_safe(SYMBOL)
+    if BOT_STATE["bought"] and BOT_STATE["buy_price"] > 0 and price:
+        upnl_pct = (price - BOT_STATE["buy_price"]) / BOT_STATE["buy_price"] * 100.0
+        pos_line = f"보유중: 평단 {BOT_STATE['buy_price']:.2f}, 수량 {BOT_STATE['buy_qty']:.6f}, 현가 {price:.2f}, 미실현 {upnl_pct:.2f}%"
+    else:
+        pos_line = "보유 포지션: 없음"
+
+    msg = (
+        f"📊 [일일 매매결산] {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_TZ})\n"
+        f"— 심볼: {SYMBOL}\n"
+        f"\n"
+        f"🔹 오늘({today})\n"
+        f"  · 거래수: {d_tot['count']} (승 {d_tot['wins']}/패 {d_tot['losses']}, 승률 {d_tot['winrate']:.1f}%)\n"
+        f"  · 실현손익: ₩{d_tot['realized_krw']:.0f} / 평균손익률 {d_tot['avg_pnl_pct']:.2f}%\n"
+        f"\n"
+        f"🔹 어제({yesterday})\n"
+        f"  · 거래수: {y_tot['count']} (승 {y_tot['wins']}/패 {y_tot['losses']}, 승률 {y_tot['winrate']:.1f}%)\n"
+        f"  · 실현손익: ₩{y_tot['realized_krw']:.0f} / 평균손익률 {y_tot['avg_pnl_pct']:.2f}%\n"
+        f"\n"
+        f"🔹 누적(전체)\n"
+        f"  · 총 실현손익: ₩{all_tot['realized_krw']:.0f} / 총 거래수 {all_tot['count']} (승률 {all_tot['winrate']:.1f}%)\n"
+        f"\n"
+        f"🔸 {pos_line}\n"
+    )
+    return msg
+
+def daily_report_scheduler():
+    send_telegram("⏰ 일일 리포트 스케줄러 시작")
+    while True:
+        try:
+            now = _tznow()
+            target = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+            if now > target:
+                target = target + timedelta(days=1)
+            sleep_sec = (target - now).total_seconds()
+            # 대기
+            if sleep_sec > 0:
+                time.sleep(min(sleep_sec, 3600))
+                continue
+
+            # 정확 시각 도달 체크
+            now_check = _tznow()
+            if now_check.hour == REPORT_HOUR and now_check.minute == REPORT_MINUTE:
+                msg = build_daily_report()
+                send_telegram(msg)
+                # 다음날로 이동
+                time.sleep(60)  # 중복 전송 방지
+            else:
+                time.sleep(5)
+        except Exception:
+            print(f"[리포트 스케줄러 예외]\n{traceback.format_exc()}")
+            time.sleep(5)
+
+# -------------------------------
 # Main Loop & Supervisor
 # -------------------------------
 def run_bot_loop():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY missing")
 
-    # 1) 업비트 인증/레이트리밋 진단 1회
     try:
         sc, body, headers = call_accounts_raw_with_headers()
         if sc != 200:
@@ -457,11 +624,6 @@ def run_bot_loop():
     buy_qty   = 0.0
     buy_uuid  = None
 
-    # 신호 알림 중복 방지 로컬 상태
-    last_alert_bars_ago = None
-    last_alert_ts = 0.0
-    MIN_ALERT_INTERVAL_SEC = 20.0
-
     while True:
         try:
             price = get_price_safe(SYMBOL)
@@ -469,53 +631,38 @@ def run_bot_loop():
                 time.sleep(2)
                 continue
 
-            # --- Signal detection & alert (dedup) ---
-            gc_ok, bars_ago = golden_cross_recent_cached()
-            now_ts = time.time()
-            if gc_ok and bars_ago is not None:
-                is_new_signal = (last_alert_bars_ago != bars_ago) or (now_ts - last_alert_ts >= MIN_ALERT_INTERVAL_SEC)
-                if is_new_signal:
-                    ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
-                    if ok_ma:
-                        send_telegram(
-                            f"🔔 골든크로스 신호 감지 (최근 {bars_ago}봉 전)\n"
-                            f"last={last_close:.2f}, SMA{MA_SHORT}={sma_s:.2f}, SMA{MA_LONG}={sma_l:.2f}"
-                        )
-                        last_alert_bars_ago = bars_ago
-                        last_alert_ts = now_ts
-                        BOT_STATE["last_signal_time"] = datetime.now().isoformat()
-                        BOT_STATE["last_signal_bars_ago"] = bars_ago
-
-            # --- Entry: Golden Cross OR Continuation (if enabled) ---
+            # --- Entry: Bar-bottom rebound (NEW) ---
             if not bought:
-                ok_ma, last_close, s_now, l_now = get_ma_values_cached()
-                allow_entry = False
-                entry_reason = None
-
-                if gc_ok:
-                    allow_entry = True
-                    entry_reason = f"골든크로스 {bars_ago}봉 전"
-                elif CONTINUATION_ALLOW and ok_ma and s_now is not None and l_now is not None and s_now > l_now:
-                    allow_entry = True
-                    entry_reason = f"추세 지속(SMA{MA_SHORT}>{MA_LONG})"
-
-                if not allow_entry:
+                ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+                if not ok:
                     time.sleep(2)
                     continue
 
-                # (옵션) Continuation으로 들어갈 때 신호성 알림
-                if entry_reason and entry_reason.startswith("추세 지속"):
+                try:
+                    ok_ma, last_close, s_now, l_now = get_ma_values_cached()
                     send_telegram(
-                        f"🔔 추세 지속 진입 조건 충족\n"
-                        f"last={last_close:.2f}, SMA{MA_SHORT}={s_now:.2f}, SMA{MA_LONG}={l_now:.2f}"
+                        "🔔 단기 반등 매수 신호 감지\n"
+                        f"- 조건: 연속 양봉 + 단기MA 상향전환 + 거래량 증가\n"
+                        f"- MA: last={last_close if last_close else 0:.2f}, "
+                        f"SMA{MA_SHORT}={(s_now if s_now else 0):.2f}, "
+                        f"SMA{MA_LONG}={(l_now if l_now else 0):.2f}\n"
+                        f"- 이유: {why}"
                     )
+                except Exception:
+                    pass
 
                 avg_buy, qty, buuid = market_buy_all(upbit)
                 if avg_buy is not None and qty and qty > 0:
                     bought, buy_price, buy_qty, buy_uuid = True, avg_buy, qty, buuid
-                    BOT_STATE.update({"bought": True, "buy_price": buy_price, "buy_qty": buy_qty,
-                                      "last_trade_time": datetime.now().isoformat()})
-                    send_telegram(f"📥 매수 진입({entry_reason})! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
+                    BOT_STATE.update({
+                        "bought": True,
+                        "buy_price": buy_price,
+                        "buy_qty": buy_qty,
+                        "last_trade_time": datetime.now().isoformat(),
+                        "last_signal_time": datetime.now().isoformat(),
+                        "last_signal_reason": why,
+                    })
+                    send_telegram(f"📥 매수 진입! 평단: {buy_price:.2f} / 수량: {buy_qty:.6f}")
                 else:
                     time.sleep(8)
                 continue
@@ -571,11 +718,16 @@ def supervisor():
 # -------------------------------
 # Import-time start (gunicorn-safe)
 # -------------------------------
-# 모듈이 임포트될 때 1회만 백그라운드 루프 시작.
 if not getattr(app, "_bot_started", False):
     threading.Thread(target=supervisor, daemon=True).start()
     app._bot_started = True
     print("[BOOT] Supervisor thread started at import")
+
+# Daily report scheduler thread
+if not getattr(app, "_report_started", False):
+    threading.Thread(target=daily_report_scheduler, daemon=True).start()
+    app._report_started = True
+    print("[BOOT] Daily report thread started at import")
 
 # -------------------------------
 # Entrypoint (local dev)
@@ -585,5 +737,9 @@ if __name__ == "__main__":
         threading.Thread(target=supervisor, daemon=True).start()
         app._bot_started = True
         print("[BOOT] Supervisor thread started via __main__")
+    if not getattr(app, "_report_started", False):
+        threading.Thread(target=daily_report_scheduler, daemon=True).start()
+        app._report_started = True
+        print("[BOOT] Daily report thread started via __main__")
     port = int(os.environ.get("PORT", 10000))  # Render 기본 PORT는 10000
     app.run(host="0.0.0.0", port=port)
