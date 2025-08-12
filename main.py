@@ -824,15 +824,19 @@ def run_bot_loop():
             if price is None:
                 time.sleep(2); continue
 
-            # --- Entry ---
+            # --- Entry (우선순위: 얼리 V → 반등 초입 → 추세 지속) ---
             if not BOT_STATE["bought"]:
-                ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+                ok, why = (False, None)
 
-                # 얼리 V-반등
-                if not ok and EARLY_REBOUND:
+                # 1) 얼리 V-반등 (최우선)
+                if EARLY_REBOUND:
                     ok, why = early_rebound_signal(SYMBOL, MA_INTERVAL)
 
-                # 추세 지속 재진입
+                # 2) (미충족 시) 반등 초입
+                if not ok:
+                    ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+
+                # 3) (그래도 아니면) 추세 지속 재진입
                 if not ok and CONT_REENTRY:
                     ok, why = continuation_signal(SYMBOL, MA_INTERVAL)
 
