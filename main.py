@@ -20,6 +20,7 @@ import asyncio
 import traceback
 import uuid
 import jwt
+import math
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 
@@ -189,6 +190,11 @@ REPORT_MINUTE  = int(os.getenv("REPORT_MINUTE", "0"))
 # SELL safety
 SELL_MIN_KRW   = float(os.getenv("SELL_MIN_KRW", "5000"))
 VOL_ROUND      = int(os.getenv("VOL_ROUND", "6"))
+
+# Dust & sweep settings
+DUST_KRW    = float(os.getenv("DUST_KRW", "50"))     # 이 금액 미만 잔여는 먼지로 간주
+DUST_QTY    = float(os.getenv("DUST_QTY", "1e-6"))   # 이 수량 이하도 먼지
+SWEEP_RETRY = int(os.getenv("SWEEP_RETRY", "1"))     # 매도 후 추가 스윕 횟수
 
 def _mask(s, keep=4):
     if not s: return ""
@@ -494,10 +500,21 @@ def check_sell_eligibility(mkt_price):
     return True, None
 
 def round_volume(vol: float) -> float:
-    if vol is None: return 0.0
-    q = round(vol, VOL_ROUND)
-    if q <= 0: return 0.0
-    return q
+    """잔고 초과 주문 방지 위해 '내림'으로 소수자릿수 맞춤"""
+    if vol is None or vol <= 0:
+        return 0.0
+    unit = 10 ** VOL_ROUND
+    q = math.floor(vol * unit) / unit
+    return q if q > 0 else 0.0
+
+
+def is_dust(qty: float, price: float | None) -> bool:
+    """아주 작은 잔여(수량/금액 기준)를 먼지로 간주"""
+    if qty is None or qty <= 0:
+        return True
+    if price is None:
+        return qty <= DUST_QTY
+    return (qty <= DUST_QTY) or ((qty * price) < DUST_KRW)
 
 # -------------------------------
 # Orders
@@ -548,8 +565,12 @@ def market_sell_all(upbit):
         if est_krw < SELL_MIN_KRW:
             msg = f"[SELL] 최소 주문금액 미만: 보유 평가 {est_krw:.0f}원 < {SELL_MIN_KRW:.0f}원"
             print(msg); send_telegram(msg)
+            # 팔 수 없지만 먼지면 포지션 종료로 간주
+            if is_dust(xrp_before, price_now):
+                send_telegram(f"🧹 매도불가 먼지 잔고 무시 처리: {xrp_before:.6f} XRP (≈₩{xrp_before*price_now:.0f})")
             return None, None, None, None
 
+        # 1차 전량 시도(내림 반올림)
         vol = round_volume(xrp_before)
         r = upbit.sell_market_order(SYMBOL, vol)
         sell_uuid = _extract_uuid(r)
@@ -560,13 +581,40 @@ def market_sell_all(upbit):
         xrp_after = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
                                         xrp_before, cmp="lt", timeout=30, interval=0.6)
         if xrp_after is None:
-            print("[SELL] 체결 확인 실패 (타임아웃)"); return None, None, None, sell_uuid
+            print("[SELL] 체결 확인 실패 (타임아웃)")
+            xrp_after = get_balance_float(upbit, "XRP")
 
-        filled = xrp_before - xrp_after
+        # 스윕: 최소주문 이상 남으면 한 번 더 판다
+        price_now = get_price_safe(SYMBOL) or price_now
+        tries = SWEEP_RETRY
+        while tries > 0 and xrp_after and price_now and (xrp_after * price_now) >= SELL_MIN_KRW:
+            vol2 = round_volume(xrp_after)
+            if vol2 <= 0:
+                break
+            r2 = upbit.sell_market_order(SYMBOL, vol2)
+            _ = _extract_uuid(r2)
+            print(f"[SELL] 추가 스윕 매도 - qty={vol2:.6f}")
+            xrp_after2 = wait_balance_change(lambda: get_balance_float(upbit, "XRP"),
+                                             xrp_after, cmp="lt", timeout=20, interval=0.5)
+            xrp_after = xrp_after2 if xrp_after2 is not None else get_balance_float(upbit, "XRP")
+            tries -= 1
+
+        # 최종 정산
         krw_after = get_krw_balance_safely(upbit)
-        avg_sell = avg_price_from_balances_sell(krw_before, krw_after, filled)
+        filled = (xrp_before - (xrp_after or 0.0)) if xrp_before is not None else None
+        avg_sell = (
+            avg_price_from_balances_sell(krw_before, krw_after, filled)
+            if (krw_before is not None and krw_after is not None and filled)
+            else None
+        )
         realized_krw = (krw_after - krw_before) if (krw_after is not None and krw_before is not None) else 0.0
-        print(f"[SELL] 체결 완료 - qty={filled:.6f}, avg={avg_sell:.6f}, pnl₩={realized_krw:.2f}")
+        avg_sell_str = f"{(avg_sell if avg_sell is not None else 0.0):.6f}"
+        print(f"[SELL] 체결 완료 - filled={filled:.6f} avg={avg_sell_str} pnl₩={realized_krw:.2f}")
+
+        # 먼지면 안내만
+        if is_dust(xrp_after or 0.0, price_now) and (xrp_after or 0.0) > 0:
+            send_telegram(f"🧹 미미한 잔여 무시 처리: {(xrp_after or 0.0):.6f} XRP (≈₩{(xrp_after or 0.0)*price_now:.0f})")
+
         return avg_sell, filled, realized_krw, sell_uuid
 
     except Exception:
@@ -614,6 +662,16 @@ def clear_pos():
 
 def reconcile_position(upbit):
     xrp = get_balance_float(upbit, "XRP")
+    price_now = get_price_safe(SYMBOL) or 0.0
+
+    # 🔸 먼지면 포지션 없음으로 처리
+    if is_dust(xrp or 0.0, price_now):
+        BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0, "peak_price": 0.0, "trail_active": False})
+        clear_pos()
+        if (xrp or 0.0) > 0:
+            send_telegram(f"🧹 복구 중 먼지 무시 처리: {xrp:.6f} XRP (≈₩{xrp*price_now:.0f})")
+        return
+
     if xrp is None or xrp <= 0:
         BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0, "peak_price": 0.0, "trail_active": False})
         clear_pos()
@@ -622,9 +680,9 @@ def reconcile_position(upbit):
     if pos:
         BOT_STATE.update({"bought": True, "buy_price": float(pos.get("buy_price", 0.0)), "buy_qty": xrp})
     else:
-        price_now = get_price_safe(SYMBOL) or 0.0
-        BOT_STATE.update({"bought": True, "buy_price": price_now, "buy_qty": xrp})
-        save_pos(price_now, xrp)
+        price_now2 = price_now or 0.0
+        BOT_STATE.update({"bought": True, "buy_price": price_now2, "buy_qty": xrp})
+        save_pos(price_now2, xrp)
     # 트레일 초기화
     BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
     BOT_STATE["trail_active"] = False
@@ -780,7 +838,18 @@ def run_bot_loop():
                         "trail_active": False,
                     })
                     save_pos(avg_buy, qty)
-                    send_telegram(f"📥 매수 진입! 평단: {avg_buy:.2f} / 수량: {qty:.6f}")
+
+                    # ▶ TP/SL 계산해서 텔레그램에 표시
+                    tp = avg_buy * (1 + PROFIT_RATIO)
+                    sl = avg_buy * (1 - LOSS_RATIO)
+                    rr = (PROFIT_RATIO / LOSS_RATIO) if LOSS_RATIO > 0 else 0.0
+
+                    send_telegram(
+                        "📥 매수 진입!\n"
+                        f"평단: {avg_buy:.2f} / 수량: {qty:.6f}\n"
+                        f"🎯 TP: {tp:.2f} (+{PROFIT_RATIO*100:.2f}%) | 🛑 SL: {sl:.2f} (-{LOSS_RATIO*100:.2f}%)\n"
+                        f"R:R ≈ {rr:.2f}:1"
+                    )
                 else:
                     time.sleep(8)
                 continue
@@ -829,7 +898,16 @@ def run_bot_loop():
                 else:
                     ok_sell, why_not = check_sell_eligibility(price)
                     if not ok_sell:
-                        send_telegram(f"⚠️ 매도 불가: {why_not}")
+                        # 잔고가 먼지면 포지션 종료로 간주
+                        xrp_now = get_balance_float(upbit, "XRP")
+                        if is_dust(xrp_now or 0.0, price):
+                            send_telegram(f"🧹 매도 실패했지만 먼지 잔고라 포지션 종료 처리: {xrp_now or 0.0:.6f} XRP")
+                            BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+                                              "last_trade_time": datetime.now().isoformat(),
+                                              "peak_price": 0.0, "trail_active": False})
+                            clear_pos()
+                        else:
+                            send_telegram(f"⚠️ 매도 불가: {why_not}")
                     time.sleep(8)
 
         except TypeError:
