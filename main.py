@@ -1,13 +1,13 @@
-# main.py — Upbit Bot (Rebound + Continuation Re-entry + Trailing Stop + Durable Position + Daily Report)
+# main.py — Upbit Bot (Rebound + Continuation Re-entry + Trailing Stop + Durable Position + Daily Report + Safe /status)
 # - Entry:
 #   A) '반등 초입' 신호 (연속 양봉 + 단기MA 꺾임 + 거래량 증가 + 스윙저점)
 #   B) '추세 지속' 재진입 (단기>장기 유지 + 가벼운 눌림 + 모멘텀 재개 + 거래량)
 # - Exit:
 #   • TP/SL 전량 시장가 매도
 #   • (옵션) 트레일링 스탑: 1R 달성 후 피크에서 TRAIL_PCT 되돌리면 청산
-# - Infra: Flask(/health, /status, /diag), Telegram, CSV logs, Daily 9AM Report
 # - Resilience: pos.json으로 포지션 영속 저장 (재시작 복구)
-# - Start: Import-time threads (bot + report), gunicorn-safe
+# - Infra: Flask(/health, /status, /diag), Telegram, CSV logs, Daily 9AM Report
+# - Status: 기본은 '얕은(light)' 모드, 상세는 /status?deep=1
 
 import os
 import time
@@ -21,7 +21,7 @@ import traceback
 import uuid
 import jwt
 from datetime import datetime, timedelta
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 try:
     from zoneinfo import ZoneInfo
@@ -44,12 +44,24 @@ def health():
 @app.route("/status")
 def status():
     try:
+        # 기본은 '얕은' 모드(가벼움). 깊은 진단은 /status?deep=1
+        deep = request.args.get("deep", "0") == "1"
+
         price = get_price_safe(SYMBOL)
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
-        ok_reb, why_reb = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
-        ok_con, why_con = (False, None)
-        if CONT_REENTRY:
-            ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL)
+
+        # 얕은 모드에선 무거운 연산/잔고조회 생략
+        ok_reb = ok_con = why_reb = why_con = None
+        if deep:
+            try:
+                ok_reb, why_reb = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+            except Exception as e:
+                ok_reb, why_reb = None, f"rebound_check_error: {e}"
+            try:
+                if CONT_REENTRY:
+                    ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL)
+            except Exception as e:
+                ok_con, why_con = None, f"cont_check_error: {e}"
 
         tp = sl = dyn_sl = trail_sl = gap_tp = gap_sl = None
         can_sell = None
@@ -58,20 +70,23 @@ def status():
             tp = BOT_STATE["buy_price"] * (1 + PROFIT_RATIO)
             sl = BOT_STATE["buy_price"] * (1 - LOSS_RATIO)
 
-            # 트레일링 계산
-            trail_sl = None
-            if USE_TRAIL:
-                # peak 갱신은 루프에서 하지만 상태표시용으로 현재가도 고려
-                peak = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price)
-                if BOT_STATE.get("trail_active", False):
-                    trail_sl = peak * (1 - TRAIL_PCT)
-                dyn_sl = max(sl, trail_sl) if trail_sl else sl
+            # 트레일링 슬 (상태 표시용)
+            if USE_TRAIL and BOT_STATE.get("trail_active", False):
+                peak = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price or 0.0)
+                trail_sl = peak * (1 - TRAIL_PCT)
+                dyn_sl = max(sl, trail_sl)
             else:
                 dyn_sl = sl
 
             gap_tp = ((tp - price) / BOT_STATE["buy_price"]) * 100.0
             gap_sl = ((price - (dyn_sl or sl)) / BOT_STATE["buy_price"]) * 100.0
-            can_sell, cannot_reason = check_sell_eligibility(price)
+
+            if deep:
+                # 잔고 조회는 deep 모드에서만 → 레이트리밋/지연 완화
+                try:
+                    can_sell, cannot_reason = check_sell_eligibility(price)
+                except Exception as e:
+                    can_sell, cannot_reason = None, f"eligibility_check_error: {e}"
 
         data = {
             "symbol": SYMBOL,
@@ -80,44 +95,38 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
+
+            # 얕은 모드에선 None (deep=1이면 값 채워짐)
             "signal_rebound_ok": ok_reb,
             "signal_rebound_reason": why_reb,
             "signal_cont_ok": ok_con,
             "signal_cont_reason": why_con,
+
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
-            "tp": tp,
-            "sl": sl,
-            "dynamic_sl": dyn_sl,
-            "trail_sl": trail_sl,
+            "tp": tp, "sl": sl, "dynamic_sl": dyn_sl, "trail_sl": trail_sl,
             "trail_active": BOT_STATE.get("trail_active", False),
             "peak_price": BOT_STATE.get("peak_price", 0.0),
-            "gap_to_tp_pct": gap_tp,
-            "gap_to_dynsl_pct": gap_sl,
+            "gap_to_tp_pct": gap_tp, "gap_to_dynsl_pct": gap_sl,
+
             "can_sell": can_sell,
             "cannot_sell_reason": cannot_reason,
+
             "last_trade_time": BOT_STATE["last_trade_time"],
             "last_error": BOT_STATE["last_error"],
             "last_signal_time": BOT_STATE["last_signal_time"],
             "last_signal_reason": BOT_STATE.get("last_signal_reason"),
+
+            # ← 에러 원인이던 REPORT_*를 확실히 정의/표시
+            "report": {"tz": REPORT_TZ, "hour": REPORT_HOUR, "minute": REPORT_MINUTE},
+
             "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "entry_params": {
-                "BULL_COUNT": BULL_COUNT, "VOL_MA": VOL_MA, "VOL_BOOST": VOL_BOOST,
-                "INFLECT_REQUIRE": INFLECT_REQUIRE, "DOWN_BARS": DOWN_BARS,
-                "SWING_LOOKBACK": SWING_LOOKBACK, "BREAK_PREVHIGH": BREAK_PREVHIGH,
-                "MA_INTERVAL": MA_INTERVAL,
-                "CONT_REENTRY": CONT_REENTRY, "CONT_N": CONT_N,
-                "PB_TOUCH_S": PB_TOUCH_S, "VOL_CONT_BOOST": VOL_CONT_BOOST
-            },
-            "trail_params": {
-                "USE_TRAIL": USE_TRAIL, "TRAIL_PCT": TRAIL_PCT, "ARM_AFTER_R": ARM_AFTER_R
-            },
-            "report": {"tz": REPORT_TZ, "hour": REPORT_HOUR, "minute": REPORT_MINUTE}
         }
         return jsonify(data)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # 진단 엔드포인트: 200 + 에러 메시지로 완충 (화면 에러 방지)
+        return jsonify({"ok": False, "error": str(e)}), 200
 
 @app.route("/diag")
 def diag():
@@ -171,6 +180,11 @@ VOL_CONT_BOOST  = float(os.getenv("VOL_CONT_BOOST", "1.00"))
 USE_TRAIL       = os.getenv("USE_TRAIL", "true").lower() == "true"
 TRAIL_PCT       = float(os.getenv("TRAIL_PCT", "0.015"))  # 1.5% 추적
 ARM_AFTER_R     = float(os.getenv("ARM_AFTER_R", "1.0"))  # 1R 달성 후 활성화
+
+# Daily report (★ 누락으로 에러 원인이던 부분 — 확실히 정의)
+REPORT_TZ      = os.getenv("REPORT_TZ", "Asia/Seoul")
+REPORT_HOUR    = int(os.getenv("REPORT_HOUR", "9"))
+REPORT_MINUTE  = int(os.getenv("REPORT_MINUTE", "0"))
 
 # SELL safety
 SELL_MIN_KRW   = float(os.getenv("SELL_MIN_KRW", "5000"))
@@ -425,8 +439,8 @@ def continuation_signal(symbol, interval):
     """
     추세 지속 재진입:
       - 최근 CONT_N봉: SMA_SHORT > SMA_LONG 유지
-      - 그 사이 가격이 SMA_SHORT 터치/하회 1회 이상 (옵션 PB_TOUCH_S)
-      - 모멘텀 재개: 직전봉이 양봉 & 직전봉 고가 돌파
+      - 그 구간에 SMA_SHORT '터치/하회' 1회 이상 (PB_TOUCH_S=True)
+      - 모멘텀 재개: -2 캔들이 양봉 & -3 고가 돌파
       - 거래량: vol[-2] >= MA(VOL_MA) * VOL_CONT_BOOST
     """
     cnt = max(MA_LONG + VOL_MA + CONT_N + 10, 160)
