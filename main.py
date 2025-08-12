@@ -1,7 +1,12 @@
-# main.py — Upbit Bot (Rebound Entry + Durable Position + Robust Sell + Daily Report)
-# - Entry: 바닥 반등 초입(연속 양봉 + 단기MA 꺾임 + 거래량 증가)
-# - Exit: TP/SL + 최소주문금액 방어 + 포지션 영속 저장(재시작 복구)
-# - Infra: Flask (/health, /status, /diag), Telegram, CSV logs, Daily 9AM Report
+# main.py — Upbit Bot (Rebound + Continuation Re-entry + Trailing Stop + Durable Position + Daily Report)
+# - Entry:
+#   A) '반등 초입' 신호 (연속 양봉 + 단기MA 꺾임 + 거래량 증가 + 스윙저점)
+#   B) '추세 지속' 재진입 (단기>장기 유지 + 가벼운 눌림 + 모멘텀 재개 + 거래량)
+# - Exit:
+#   • TP/SL 전량 시장가 매도
+#   • (옵션) 트레일링 스탑: 1R 달성 후 피크에서 TRAIL_PCT 되돌리면 청산
+# - Infra: Flask(/health, /status, /diag), Telegram, CSV logs, Daily 9AM Report
+# - Resilience: pos.json으로 포지션 영속 저장 (재시작 복구)
 # - Start: Import-time threads (bot + report), gunicorn-safe
 
 import os
@@ -41,16 +46,31 @@ def status():
     try:
         price = get_price_safe(SYMBOL)
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
-        ok_sig, why_sig = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+        ok_reb, why_reb = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+        ok_con, why_con = (False, None)
+        if CONT_REENTRY:
+            ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL)
 
-        tp = sl = gap_tp = gap_sl = None
+        tp = sl = dyn_sl = trail_sl = gap_tp = gap_sl = None
         can_sell = None
         cannot_reason = None
         if BOT_STATE["bought"] and BOT_STATE["buy_price"] > 0 and price:
             tp = BOT_STATE["buy_price"] * (1 + PROFIT_RATIO)
             sl = BOT_STATE["buy_price"] * (1 - LOSS_RATIO)
+
+            # 트레일링 계산
+            trail_sl = None
+            if USE_TRAIL:
+                # peak 갱신은 루프에서 하지만 상태표시용으로 현재가도 고려
+                peak = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price)
+                if BOT_STATE.get("trail_active", False):
+                    trail_sl = peak * (1 - TRAIL_PCT)
+                dyn_sl = max(sl, trail_sl) if trail_sl else sl
+            else:
+                dyn_sl = sl
+
             gap_tp = ((tp - price) / BOT_STATE["buy_price"]) * 100.0
-            gap_sl = ((price - sl) / BOT_STATE["buy_price"]) * 100.0
+            gap_sl = ((price - (dyn_sl or sl)) / BOT_STATE["buy_price"]) * 100.0
             can_sell, cannot_reason = check_sell_eligibility(price)
 
         data = {
@@ -60,15 +80,21 @@ def status():
             "ma_last": last_close,
             "sma_short": sma_s,
             "sma_long": sma_l,
-            "signal_ok": ok_sig,
-            "signal_reason": why_sig,
+            "signal_rebound_ok": ok_reb,
+            "signal_rebound_reason": why_reb,
+            "signal_cont_ok": ok_con,
+            "signal_cont_reason": why_con,
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
             "buy_qty": BOT_STATE["buy_qty"],
             "tp": tp,
             "sl": sl,
+            "dynamic_sl": dyn_sl,
+            "trail_sl": trail_sl,
+            "trail_active": BOT_STATE.get("trail_active", False),
+            "peak_price": BOT_STATE.get("peak_price", 0.0),
             "gap_to_tp_pct": gap_tp,
-            "gap_to_sl_pct": gap_sl,
+            "gap_to_dynsl_pct": gap_sl,
             "can_sell": can_sell,
             "cannot_sell_reason": cannot_reason,
             "last_trade_time": BOT_STATE["last_trade_time"],
@@ -81,6 +107,11 @@ def status():
                 "INFLECT_REQUIRE": INFLECT_REQUIRE, "DOWN_BARS": DOWN_BARS,
                 "SWING_LOOKBACK": SWING_LOOKBACK, "BREAK_PREVHIGH": BREAK_PREVHIGH,
                 "MA_INTERVAL": MA_INTERVAL,
+                "CONT_REENTRY": CONT_REENTRY, "CONT_N": CONT_N,
+                "PB_TOUCH_S": PB_TOUCH_S, "VOL_CONT_BOOST": VOL_CONT_BOOST
+            },
+            "trail_params": {
+                "USE_TRAIL": USE_TRAIL, "TRAIL_PCT": TRAIL_PCT, "ARM_AFTER_R": ARM_AFTER_R
             },
             "report": {"tz": REPORT_TZ, "hour": REPORT_HOUR, "minute": REPORT_MINUTE}
         }
@@ -109,8 +140,8 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SYMBOL          = os.getenv("SYMBOL", "KRW-XRP")
-PROFIT_RATIO    = float(os.getenv("PROFIT_RATIO", "0.03"))  # +3%
-LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # -1%
+PROFIT_RATIO    = float(os.getenv("PROFIT_RATIO", "0.02"))  # 기본 2:1 (TP +2%)
+LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # (SL -1%)
 
 # MA/Interval
 MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute1")
@@ -119,7 +150,7 @@ MA_LONG         = int(os.getenv("MA_LONG", "20"))
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
 
 CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
-POS_FILE = os.getenv("POS_FILE", "pos.json")   # ★ 포지션 영속 저장 파일
+POS_FILE = os.getenv("POS_FILE", "pos.json")
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -130,14 +161,20 @@ DOWN_BARS       = int(os.getenv("DOWN_BARS", "6"))
 SWING_LOOKBACK  = int(os.getenv("SWING_LOOKBACK", "12"))
 BREAK_PREVHIGH  = os.getenv("BREAK_PREVHIGH", "true").lower() == "true"
 
-# Daily report
-REPORT_TZ      = os.getenv("REPORT_TZ", "Asia/Seoul")
-REPORT_HOUR    = int(os.getenv("REPORT_HOUR", "9"))
-REPORT_MINUTE  = int(os.getenv("REPORT_MINUTE", "0"))
+# Continuation re-entry
+CONT_REENTRY    = os.getenv("CONT_REENTRY", "true").lower() == "true"
+CONT_N          = int(os.getenv("CONT_N", "5"))
+PB_TOUCH_S      = os.getenv("PB_TOUCH_S", "true").lower() == "true"
+VOL_CONT_BOOST  = float(os.getenv("VOL_CONT_BOOST", "1.00"))
+
+# Trailing stop
+USE_TRAIL       = os.getenv("USE_TRAIL", "true").lower() == "true"
+TRAIL_PCT       = float(os.getenv("TRAIL_PCT", "0.015"))  # 1.5% 추적
+ARM_AFTER_R     = float(os.getenv("ARM_AFTER_R", "1.0"))  # 1R 달성 후 활성화
 
 # SELL safety
-SELL_MIN_KRW   = float(os.getenv("SELL_MIN_KRW", "5000"))   # 업비트 최소 주문 금액
-VOL_ROUND      = int(os.getenv("VOL_ROUND", "6"))           # 매도 수량 라운딩 소수자리
+SELL_MIN_KRW   = float(os.getenv("SELL_MIN_KRW", "5000"))
+VOL_ROUND      = int(os.getenv("VOL_ROUND", "6"))
 
 def _mask(s, keep=4):
     if not s: return ""
@@ -157,6 +194,8 @@ BOT_STATE = {
     "last_trade_time": None,
     "last_signal_time": None,
     "last_signal_reason": None,
+    "peak_price": 0.0,
+    "trail_active": False,
 }
 
 # 캐시
@@ -322,15 +361,16 @@ def get_ma_values_cached():
     return ok, last_close, sma_s, sma_l
 
 # -------------------------------
-# NEW: 바닥 반등 초입 신호
+# Entry Signals
 # -------------------------------
 def bullish_rebound_signal(symbol, interval):
     """
-    A) 직전 하락: 최근 DOWN_BARS 닫힌봉에서 SMA_SHORT <= SMA_LONG 다수
-    B) 스윙저점: 최근 SWING_LOOKBACK 최저가 ≈ 직전봉 저가
-    C) 전환봉: 양봉 & (옵션) 직전봉 고가 돌파
-    D) 단기MA 꺾임: s[-2] > s[-3] & s[-3] <= s[-4] (옵션)
-    E) 거래량 증가: vol[-2] > MA(VOL_MA)*VOL_BOOST
+    반등 초입:
+      A) 직전 하락: 최근 DOWN_BARS 닫힌봉에서 SMA_SHORT <= SMA_LONG 다수
+      B) 스윙저점: 최근 SWING_LOOKBACK 최저가 ≈ 직전봉 저가
+      C) 전환봉: 양봉 & (옵션) 직전봉 고가 돌파
+      D) 단기MA 꺾임: s[-2] > s[-3] & s[-3] <= s[-4] (옵션)
+      E) 거래량 증가: vol[-2] > MA(VOL_MA)*VOL_BOOST
     """
     cnt = max(MA_LONG + VOL_MA + SWING_LOOKBACK + 10, 160)
     df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
@@ -355,8 +395,7 @@ def bullish_rebound_signal(symbol, interval):
         return False, "no swing low at -2"
 
     # C)
-    bull_now = float(close.iloc[-2]) > float(open_.iloc[-2])
-    if not bull_now:
+    if not (float(close.iloc[-2]) > float(open_.iloc[-2])):
         return False, "last candle not bullish"
     if BREAK_PREVHIGH and not (float(close.iloc[-2]) > float(high.iloc[-3])):
         return False, "no break of prev high"
@@ -378,28 +417,57 @@ def bullish_rebound_signal(symbol, interval):
     if not (vol_now > vol_ma * VOL_BOOST):
         return False, f"volume not boosted ({int(vol_now)} <= {int(vol_ma*VOL_BOOST)})"
 
-    why = (f"downtrend={down_cnt}/{DOWN_BARS}, swingLow, breakHigh={BREAK_PREVHIGH}, "
+    why = (f"rebound: downtrend={down_cnt}/{DOWN_BARS}, swingLow, breakHigh={BREAK_PREVHIGH}, "
            f"MA turn up, vol↑ {int(vol_now)}>{int(vol_ma*VOL_BOOST)}")
     return True, why
 
-# -------------------------------
-# 주문 응답 방어
-# -------------------------------
-def _extract_uuid(r):
-    if isinstance(r, dict):
-        if "error" in r:
-            print(f"[UPBIT ORDER ERROR] {r['error']}")
-            return None
-        return r.get("uuid")
-    return None
+def continuation_signal(symbol, interval):
+    """
+    추세 지속 재진입:
+      - 최근 CONT_N봉: SMA_SHORT > SMA_LONG 유지
+      - 그 사이 가격이 SMA_SHORT 터치/하회 1회 이상 (옵션 PB_TOUCH_S)
+      - 모멘텀 재개: 직전봉이 양봉 & 직전봉 고가 돌파
+      - 거래량: vol[-2] >= MA(VOL_MA) * VOL_CONT_BOOST
+    """
+    cnt = max(MA_LONG + VOL_MA + CONT_N + 10, 160)
+    df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
+    if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, CONT_N) + 5:
+        return False, "df insufficient"
+
+    close, open_, high, low, vol = df["close"], df["open"], df["high"], df["low"], df["volume"]
+    sma_s = close.rolling(MA_SHORT).mean()
+    sma_l = close.rolling(MA_LONG).mean()
+
+    # 최근 CONT_N봉(닫힌봉 기준: -2부터 카운트) 추세 유지
+    ok_trend = all(float(sma_s.iloc[-1 - k]) > float(sma_l.iloc[-1 - k]) for k in range(1, CONT_N + 1))
+    if not ok_trend:
+        return False, "trend not sustained"
+
+    # 눌림: 그 구간 내 SMA_SHORT 터치/하회 1회 이상
+    if PB_TOUCH_S:
+        touched = False
+        for k in range(1, CONT_N + 1):
+            if float(low.iloc[-1 - k]) <= float(sma_s.iloc[-1 - k]):
+                touched = True
+                break
+        if not touched:
+            return False, "no pullback to short MA"
+
+    # 재개 캔들
+    if not (float(close.iloc[-2]) > float(open_.iloc[-2]) and float(close.iloc[-2]) > float(high.iloc[-3])):
+        return False, "no momentum resume"
+
+    # 거래량
+    vma = float(vol.rolling(VOL_MA).mean().iloc[-2])
+    if not (float(vol.iloc[-2]) >= vma * VOL_CONT_BOOST):
+        return False, "volume not enough"
+
+    return True, f"continuation: N={CONT_N}, pullback={PB_TOUCH_S}, vol≥{VOL_CONT_BOOST}x"
 
 # -------------------------------
-# Sell helpers (min order + rounding + eligibility)
+# Sell helpers
 # -------------------------------
 def check_sell_eligibility(mkt_price):
-    """
-    최소 주문금액(SELL_MIN_KRW) 충족 여부와 사유 반환
-    """
     upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
     xrp_bal = get_balance_float(upbit, "XRP")
     if xrp_bal is None or xrp_bal <= 0:
@@ -414,7 +482,6 @@ def check_sell_eligibility(mkt_price):
 def round_volume(vol: float) -> float:
     if vol is None: return 0.0
     q = round(vol, VOL_ROUND)
-    # Upbit 호가/수량 제약은 pyupbit가 내부 처리, 보수적으로 아주 작은 찌꺼기 제거
     if q <= 0: return 0.0
     return q
 
@@ -493,6 +560,14 @@ def market_sell_all(upbit):
         BOT_STATE["last_error"] = f"SELL: {traceback.format_exc()}"
         return None, None, None, None
 
+def _extract_uuid(r):
+    if isinstance(r, dict):
+        if "error" in r:
+            print(f"[UPBIT ORDER ERROR] {r['error']}")
+            return None
+        return r.get("uuid")
+    return None
+
 # -------------------------------
 # Position persistence (pos.json)
 # -------------------------------
@@ -524,26 +599,21 @@ def clear_pos():
         print(f"[POS DELETE 실패] {e}")
 
 def reconcile_position(upbit):
-    """
-    부팅/재시작 시 보유잔고와 pos.json 동기화.
-    """
     xrp = get_balance_float(upbit, "XRP")
     if xrp is None or xrp <= 0:
-        # 보유 없음 → 상태 초기화
-        BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0})
+        BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0, "peak_price": 0.0, "trail_active": False})
         clear_pos()
         return
-
     pos = load_pos()
     if pos:
-        # 파일 기준으로 복구
         BOT_STATE.update({"bought": True, "buy_price": float(pos.get("buy_price", 0.0)), "buy_qty": xrp})
-        # 수량은 실제 잔고로 덮어씌움(부분청산/수동거래 대응)
     else:
-        # 파일이 없는데 잔고가 있다면(재배포 등) — 보수적으로 현재가를 평단으로 설정
         price_now = get_price_safe(SYMBOL) or 0.0
         BOT_STATE.update({"bought": True, "buy_price": price_now, "buy_qty": xrp})
         save_pos(price_now, xrp)
+    # 트레일 초기화
+    BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
+    BOT_STATE["trail_active"] = False
     send_telegram(f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f}, avg≈{BOT_STATE['buy_price']:.2f}")
 
 # -------------------------------
@@ -666,14 +736,15 @@ def run_bot_loop():
             # --- Entry ---
             if not BOT_STATE["bought"]:
                 ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+                if not ok and CONT_REENTRY:
+                    ok, why = continuation_signal(SYMBOL, MA_INTERVAL)
                 if not ok:
                     time.sleep(2); continue
 
                 try:
                     ok_ma, last_close, s_now, l_now = get_ma_values_cached()
                     send_telegram(
-                        "🔔 단기 반등 매수 신호 감지\n"
-                        f"- 조건: 연속 양봉 + 단기MA 상향전환 + 거래량 증가\n"
+                        "🔔 매수 신호 감지\n"
                         f"- MA: last={last_close if last_close else 0:.2f}, "
                         f"SMA{MA_SHORT}={(s_now if s_now else 0):.2f}, "
                         f"SMA{MA_LONG}={(l_now if l_now else 0):.2f}\n"
@@ -691,25 +762,41 @@ def run_bot_loop():
                         "last_trade_time": datetime.now().isoformat(),
                         "last_signal_time": datetime.now().isoformat(),
                         "last_signal_reason": why,
+                        "peak_price": avg_buy,
+                        "trail_active": False,
                     })
-                    save_pos(avg_buy, qty)  # ★ 포지션 저장
+                    save_pos(avg_buy, qty)
                     send_telegram(f"📥 매수 진입! 평단: {avg_buy:.2f} / 수량: {qty:.6f}")
                 else:
                     time.sleep(8)
                 continue
 
-            # --- Exit: TP/SL ---
+            # --- Exit: TP/SL (+ trailing) ---
             buy_price = BOT_STATE["buy_price"]
             tp = buy_price * (1 + PROFIT_RATIO)
-            sl = buy_price * (1 - LOSS_RATIO)
+            base_sl = buy_price * (1 - LOSS_RATIO)
 
-            if price >= tp or price <= sl:
+            # 피크 갱신
+            BOT_STATE["peak_price"] = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price)
+
+            # 1R 달성 시 트레일 무장
+            if USE_TRAIL and not BOT_STATE.get("trail_active", False):
+                if price >= buy_price * (1 + LOSS_RATIO * ARM_AFTER_R):
+                    BOT_STATE["trail_active"] = True
+                    send_telegram(f"🛡️ 트레일링 활성화: peak={BOT_STATE['peak_price']:.2f}, trail={TRAIL_PCT*100:.2f}%")
+
+            dyn_sl = base_sl
+            if USE_TRAIL and BOT_STATE.get("trail_active", False):
+                trail_sl = BOT_STATE["peak_price"] * (1 - TRAIL_PCT)
+                dyn_sl = max(base_sl, trail_sl)
+
+            if price >= tp or price <= dyn_sl:
                 avg_sell, qty_sold, realized_krw, suuid = market_sell_all(upbit)
                 if avg_sell is not None and qty_sold and qty_sold > 0:
                     pnl_pct = ((avg_sell - buy_price) / buy_price) * 100.0 if buy_price else 0.0
                     is_win = price >= tp
-                    msg = "🎯 익절!" if is_win else "💥 손절!"
-                    send_telegram(f"{msg} 매도가 평단: {avg_sell:.2f} / 수량: {qty_sold:.6f}")
+                    tag = "🎯 익절!" if is_win else ("🛡️ 트레일링 청산" if USE_TRAIL and price > base_sl else "💥 손절!")
+                    send_telegram(f"{tag} 매도가 평단: {avg_sell:.2f} / 수량: {qty_sold:.6f}")
 
                     save_trade(
                         side=("익절" if is_win else "손절"),
@@ -721,12 +808,11 @@ def run_bot_loop():
                         sell_uuid=suuid,
                         ts=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     )
-                    # 상태 초기화 + 포지션 파일 삭제
                     BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
-                                      "last_trade_time": datetime.now().isoformat()})
+                                      "last_trade_time": datetime.now().isoformat(),
+                                      "peak_price": 0.0, "trail_active": False})
                     clear_pos()
                 else:
-                    # 실패 사유 진단 메시지
                     ok_sell, why_not = check_sell_eligibility(price)
                     if not ok_sell:
                         send_telegram(f"⚠️ 매도 불가: {why_not}")
