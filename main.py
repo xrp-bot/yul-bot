@@ -1,6 +1,7 @@
 # main.py — Upbit Bot
 # (Rebound + Early V-Rebound + Continuation Re-entry + Trailing Stop
-#  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore)
+#  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore
+#  + Persistent Disk + Manual avg setter)
 
 import os
 import time
@@ -48,17 +49,15 @@ def status():
         why_reb = why_con = why_early = None
         if deep:
             try:
+                ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "disabled")
+            except Exception as e:
+                ok_early, why_early = None, f"early_check_error: {e}"
+            try:
                 ok_reb, why_reb = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
             except Exception as e:
                 ok_reb, why_reb = None, f"rebound_check_error: {e}"
             try:
-                if EARLY_REBOUND:
-                    ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL)
-            except Exception as e:
-                ok_early, why_early = None, f"early_check_error: {e}"
-            try:
-                if CONT_REENTRY:
-                    ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL)
+                ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL) if CONT_REENTRY else (False, "disabled")
             except Exception as e:
                 ok_con, why_con = None, f"cont_check_error: {e}"
 
@@ -94,15 +93,19 @@ def status():
             "sma_short": sma_s,
             "sma_long": sma_l,
 
-            "signal_rebound_ok": ok_reb,
-            "signal_rebound_reason": why_reb,
             "signal_early_ok": ok_early,
             "signal_early_reason": why_early,
+            "signal_rebound_ok": ok_reb,
+            "signal_rebound_reason": why_reb,
             "signal_cont_ok": ok_con,
             "signal_cont_reason": why_con,
 
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
+            "avg_unknown": BOT_STATE.get("avg_unknown", False),
+            "recover_mode": RECOVER_MODE,
+            "persist_dir": PERSIST_DIR,
+
             "buy_qty": BOT_STATE["buy_qty"],
             "tp": tp, "sl": sl, "dynamic_sl": dyn_sl, "trail_sl": trail_sl,
             "trail_active": BOT_STATE.get("trail_active", False),
@@ -136,6 +139,36 @@ def diag():
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
+# ✨ 수동 평단 설정 엔드포인트 (pos.json 유실 시 복구용)
+@app.route("/setavg", methods=["GET","POST"])
+def setavg():
+    val = request.args.get("avg") or request.form.get("avg")
+    if val is None:
+        return jsonify({"ok": False, "error": "avg query/form param required"}), 400
+    try:
+        avg = float(val)
+    except Exception:
+        return jsonify({"ok": False, "error": "avg must be a number"}), 400
+
+    upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+    coin_bal = get_balance_float(upbit, COIN)
+    if coin_bal is None or coin_bal <= 0:
+        return jsonify({"ok": False, "error": f"no {COIN} balance to bind avg"}), 400
+
+    BOT_STATE.update({
+        "bought": True,
+        "buy_price": avg,
+        "buy_qty": coin_bal,
+        "peak_price": avg,
+        "trail_active": False,
+        "avg_unknown": False,
+        "avg_warned": False,
+        "last_trade_time": datetime.now().isoformat(),
+    })
+    save_pos(avg, coin_bal)
+    send_telegram(f"✅ 수동 평단 설정 완료 — {COIN} avg={avg:.2f}, qty={coin_bal:.6f}")
+    return jsonify({"ok": True, "avg": avg, "qty": coin_bal, "symbol": SYMBOL})
+
 # -------------------------------
 # ENV & Strategy Params
 # -------------------------------
@@ -164,8 +197,16 @@ MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
 
-CSV_FILE = os.getenv("CSV_FILE", "trades.csv")
-POS_FILE = os.getenv("POS_FILE", "pos.json")
+# 🔒 영구 저장소 설정 (Render 디스크 권장)
+PERSIST_DIR     = os.getenv("PERSIST_DIR", "/var/data")
+try:
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+except Exception as _e:
+    print(f"[WARN] cannot create PERSIST_DIR {PERSIST_DIR}: {_e}")
+    PERSIST_DIR = "."
+
+CSV_FILE = os.getenv("CSV_FILE", os.path.join(PERSIST_DIR, "trades.csv"))
+POS_FILE = os.getenv("POS_FILE", os.path.join(PERSIST_DIR, "pos.json"))
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -207,11 +248,17 @@ DUST_KRW    = float(os.getenv("DUST_KRW", "50"))
 DUST_QTY    = float(os.getenv("DUST_QTY", "1e-6"))
 SWEEP_RETRY = int(os.getenv("SWEEP_RETRY", "1"))
 
+# 포지션 복구 모드
+#   - "halt"(기본): pos.json 없으면 평단 추정 금지, 거래 일시정지 + 안내
+#   - "market": 기존처럼 현재가를 임시 평단으로 간주(권장X)
+RECOVER_MODE = os.getenv("RECOVER_MODE", "halt").lower()
+
 def _mask(s, keep=4):
     if not s: return ""
     return s[:keep] + "*" * max(0, len(s) - keep)
 
 print(f"[ENV] ACCESS_KEY={_mask(ACCESS_KEY)} SECRET_KEY={_mask(SECRET_KEY)} SYMBOL={SYMBOL} COIN={COIN}")
+print(f"[ENV] PERSIST_DIR={PERSIST_DIR} POS_FILE={POS_FILE} CSV_FILE={CSV_FILE} RECOVER_MODE={RECOVER_MODE}")
 
 # -------------------------------
 # Shared State
@@ -227,6 +274,8 @@ BOT_STATE = {
     "last_signal_reason": None,
     "peak_price": 0.0,
     "trail_active": False,
+    "avg_unknown": False,
+    "avg_warned": False,
 }
 
 _last_ma_update_ts = 0.0
@@ -394,14 +443,6 @@ def get_ma_values_cached():
 # Entry Signals
 # -------------------------------
 def bullish_rebound_signal(symbol, interval):
-    """
-    반등 초입(보수형):
-      A) DOWN_BARS 구간에서 SMA_SHORT <= SMA_LONG 다수
-      B) 스윙저점: low[-2] ≈ 최근 SWING_LOOKBACK 최저가(±0.15%)
-      C) 전환 양봉 + (옵션) 직전 고가 돌파
-      D) 단기선 꺾임(INFLECT): s[-2] > s[-3] & s[-3] <= s[-4] (또는 완화)
-      E) 거래량 증가: vol[-2] > MA(VOL_MA)*VOL_BOOST
-    """
     cnt = max(MA_LONG + VOL_MA + SWING_LOOKBACK + 10, 160)
     df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
     if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, SWING_LOOKBACK) + 5:
@@ -443,14 +484,6 @@ def bullish_rebound_signal(symbol, interval):
     return True, "rebound: downtrend, swingLow, breakHigh, MA turn up, vol up"
 
 def early_rebound_signal(symbol, interval):
-    """
-    얼리 V-반등(공격형; 동그라미 구간용):
-      - -2 캔들 양봉
-      - 아랫꼬리 길이 >= EARLY_WICK_RATIO × 몸통
-      - 스윙저점 근접(±0.3%) : low[-2] ≈ 최근 EARLY_SWING_LOOKBK 최저가
-      - 거래량: vol[-2] ≥ MA(VOL_MA) × EARLY_VOL_BOOST
-      - 단기선 회복 시도: SMA_SHORT[-2] ≥ SMA_SHORT[-3] 또는 close[-2] ≥ SMA_SHORT[-2]
-    """
     cnt = max(MA_LONG + VOL_MA + EARLY_SWING_LOOKBK + 10, 160)
     df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
     if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, EARLY_SWING_LOOKBK) + 5:
@@ -482,13 +515,6 @@ def early_rebound_signal(symbol, interval):
     return True, "early_v_rebound: long lower wick + swing low + vol + shortMA recover"
 
 def continuation_signal(symbol, interval):
-    """
-    추세 지속 재진입:
-      - 최근 CONT_N봉: SMA_SHORT > SMA_LONG 유지
-      - 그 구간에 SMA_SHORT 터치/하회 1회 이상(PB_TOUCH_S)
-      - 모멘텀 재개: close[-2] > open[-2] & close[-2] > high[-3]
-      - 거래량: vol[-2] ≥ MA(VOL_MA) × VOL_CONT_BOOST
-    """
     cnt = max(MA_LONG + VOL_MA + CONT_N + 10, 160)
     df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
     if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, CONT_N) + 5:
@@ -611,7 +637,7 @@ def market_sell_all(upbit):
             print("[SELL] 체결 확인 실패 (타임아웃)")
             coin_after = get_balance_float(upbit, COIN)
 
-        # 스윕 (잔여가 최소주문 이상이면 추가 매도)
+        # 스윕
         price_now = get_price_safe(SYMBOL) or price_now
         tries = SWEEP_RETRY
         while tries > 0 and coin_after and price_now and (coin_after * price_now) >= SELL_MIN_KRW:
@@ -687,27 +713,61 @@ def reconcile_position(upbit):
     coin_bal = get_balance_float(upbit, COIN)
     price_now = get_price_safe(SYMBOL) or 0.0
 
+    # 먼지면 포지션 없음 처리
     if is_dust(coin_bal or 0.0, price_now):
-        BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0, "peak_price": 0.0, "trail_active": False})
+        BOT_STATE.update({
+            "bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+            "peak_price": 0.0, "trail_active": False,
+            "avg_unknown": False, "avg_warned": False
+        })
         clear_pos()
         if (coin_bal or 0.0) > 0:
-            send_telegram(f"🧹 복구 중 먼지 무시 처리: {coin_bal:.6f} {COIN} (≈₩{coin_bal*price_now:.0f})")
+            send_telegram(f"🧹 복구 중 먼지 무시: {coin_bal:.6f} {COIN} (≈₩{coin_bal*price_now:.0f})")
         return
 
-    if coin_bal is None or coin_bal <= 0:
-        BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0, "peak_price": 0.0, "trail_active": False})
+    if not coin_bal or coin_bal <= 0:
+        BOT_STATE.update({
+            "bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+            "peak_price": 0.0, "trail_active": False,
+            "avg_unknown": False, "avg_warned": False
+        })
         clear_pos()
         return
+
     pos = load_pos()
     if pos:
-        BOT_STATE.update({"bought": True, "buy_price": float(pos.get("buy_price", 0.0)), "buy_qty": coin_bal})
+        BOT_STATE.update({
+            "bought": True,
+            "buy_price": float(pos.get("buy_price", 0.0)),
+            "buy_qty": coin_bal,
+            "avg_unknown": False,
+            "avg_warned": False
+        })
+        # 트레일 초기화
+        BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
+        BOT_STATE["trail_active"] = False
+        send_telegram(f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f} {COIN}, avg≈{BOT_STATE['buy_price']:.2f}")
     else:
-        BOT_STATE.update({"bought": True, "buy_price": price_now, "buy_qty": coin_bal})
-        save_pos(price_now, coin_bal)
-
-    BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
-    BOT_STATE["trail_active"] = False
-    send_telegram(f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f} {COIN}, avg≈{BOT_STATE['buy_price']:.2f}")
+        if RECOVER_MODE == "market":
+            # (비권장) 현재가를 임시 평단으로 간주
+            BOT_STATE.update({
+                "bought": True, "buy_price": price_now, "buy_qty": coin_bal,
+                "peak_price": price_now, "trail_active": False,
+                "avg_unknown": False, "avg_warned": False
+            })
+            save_pos(price_now, coin_bal)
+            send_telegram(f"⚠️ pos.json 없음 → 임시평단=현재가({price_now:.2f})로 설정")
+        else:
+            # 기본: 평단 미확정 상태로 거래 일시정지
+            BOT_STATE.update({
+                "bought": True, "buy_price": 0.0, "buy_qty": coin_bal,
+                "peak_price": 0.0, "trail_active": False,
+                "avg_unknown": True, "avg_warned": False
+            })
+            send_telegram(
+                "⏸ pos.json 없음 + 잔고 존재 → 평단 미확정으로 거래 일시정지\n"
+                f"➡ 브라우저로 {request.host_url if request else ''}setavg?avg=당신의평단  호출해서 평단을 설정하세요."
+            )
 
 # -------------------------------
 # Daily 9AM Report
@@ -758,7 +818,7 @@ def build_daily_report():
         upnl_pct = (price - BOT_STATE["buy_price"]) / BOT_STATE["buy_price"] * 100.0
         pos_line = f"보유중: 평단 {BOT_STATE['buy_price']:.2f}, 수량 {BOT_STATE['buy_qty']:.6f} {COIN}, 현가 {price:.2f}, 미실현 {upnl_pct:.2f}%"
     else:
-        pos_line = "보유 포지션: 없음"
+        pos_line = "보유 포지션: 없음 / 또는 평단 미확정"
     msg = (
         f"📊 [일일 매매결산] {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_TZ})\n"
         f"— 심볼: {SYMBOL}\n\n"
@@ -828,15 +888,12 @@ def run_bot_loop():
             if not BOT_STATE["bought"]:
                 ok, why = (False, None)
 
-                # 1) 얼리 V-반등 (최우선)
                 if EARLY_REBOUND:
                     ok, why = early_rebound_signal(SYMBOL, MA_INTERVAL)
 
-                # 2) (미충족 시) 반등 초입
                 if not ok:
                     ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
 
-                # 3) (그래도 아니면) 추세 지속 재진입
                 if not ok and CONT_REENTRY:
                     ok, why = continuation_signal(SYMBOL, MA_INTERVAL)
 
@@ -866,10 +923,11 @@ def run_bot_loop():
                         "last_signal_reason": why,
                         "peak_price": avg_buy,
                         "trail_active": False,
+                        "avg_unknown": False,
+                        "avg_warned": False,
                     })
                     save_pos(avg_buy, qty)
 
-                    # 텔레그램에 TP/SL/RR
                     tp = avg_buy * (1 + PROFIT_RATIO)
                     sl = avg_buy * (1 - LOSS_RATIO)
                     rr = (PROFIT_RATIO / LOSS_RATIO) if LOSS_RATIO > 0 else 0.0
@@ -884,6 +942,17 @@ def run_bot_loop():
                 continue
 
             # --- Exit: TP/SL (+ trailing) ---
+            # 평단 미확정이면 거래 일시정지(오버셀 방지)
+            if BOT_STATE.get("avg_unknown", False) or BOT_STATE["buy_price"] <= 0:
+                if not BOT_STATE.get("avg_warned", False):
+                    send_telegram(
+                        "⏸ 평단 미확정 상태라 청산/트레일링을 중지합니다.\n"
+                        f"➡ 브라우저로 {request.host_url if request else ''}setavg?avg=당신의평단  호출해서 평단을 설정하세요."
+                    )
+                    BOT_STATE["avg_warned"] = True
+                time.sleep(3)
+                continue
+
             buy_price = BOT_STATE["buy_price"]
             tp = buy_price * (1 + PROFIT_RATIO)
             base_sl = buy_price * (1 - LOSS_RATIO)
@@ -920,7 +989,8 @@ def run_bot_loop():
                     )
                     BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
                                       "last_trade_time": datetime.now().isoformat(),
-                                      "peak_price": 0.0, "trail_active": False})
+                                      "peak_price": 0.0, "trail_active": False,
+                                      "avg_unknown": False, "avg_warned": False})
                     clear_pos()
                 else:
                     ok_sell, why_not = check_sell_eligibility(price)
@@ -930,7 +1000,8 @@ def run_bot_loop():
                             send_telegram(f"🧹 매도 실패했지만 먼지 잔고라 포지션 종료 처리: {coin_now or 0.0:.6f} {COIN}")
                             BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
                                               "last_trade_time": datetime.now().isoformat(),
-                                              "peak_price": 0.0, "trail_active": False})
+                                              "peak_price": 0.0, "trail_active": False,
+                                              "avg_unknown": False, "avg_warned": False})
                             clear_pos()
                         else:
                             send_telegram(f"⚠️ 매도 불가: {why_not}")
