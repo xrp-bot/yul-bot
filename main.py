@@ -1,7 +1,7 @@
 # main.py — Upbit Bot
 # (Rebound + Early V-Rebound + Continuation Re-entry + Trailing Stop
 #  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore
-#  + Telegram Pinned Avg Persistence + ENV fallback + Manual /setavg)
+#  + Persistent Disk + Manual avg setter)
 
 import os
 import time
@@ -16,7 +16,7 @@ import traceback
 import uuid
 import jwt
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, has_request_context
 
 try:
     from zoneinfo import ZoneInfo
@@ -28,6 +28,13 @@ except Exception:
 # -------------------------------
 app = Flask(__name__)
 
+def _host_url_safe() -> str:
+    """요청 컨텍스트가 없을 때도 안전하게 host_url을 제공."""
+    try:
+        return request.host_url if has_request_context() else ""
+    except Exception:
+        return ""
+
 @app.route("/")
 def index():
     return "✅ Yul Bot is running (Web Service)"
@@ -35,12 +42,6 @@ def index():
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "ts": datetime.now().isoformat()}), 200
-
-def get_host_url_safe():
-    try:
-        return request.host_url
-    except Exception:
-        return ""
 
 @app.route("/status")
 def status():
@@ -51,8 +52,8 @@ def status():
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
 
         # 신호 진단(무거운 연산은 deep일 때만)
-        ok_early = ok_reb = ok_con = None
-        why_early = why_reb = why_con = None
+        ok_reb = ok_con = ok_early = None
+        why_reb = why_con = why_early = None
         if deep:
             try:
                 ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "disabled")
@@ -108,13 +109,11 @@ def status():
 
             "bought": BOT_STATE["bought"],
             "buy_price": BOT_STATE["buy_price"],
-            "buy_qty": BOT_STATE["buy_qty"],
-
             "avg_unknown": BOT_STATE.get("avg_unknown", False),
-            "persist_dir": PERSIST_DIR,
             "recover_mode": RECOVER_MODE,
-            "tg_pin_pos": TG_PIN_POS,
+            "persist_dir": PERSIST_DIR,
 
+            "buy_qty": BOT_STATE["buy_qty"],
             "tp": tp, "sl": sl, "dynamic_sl": dyn_sl, "trail_sl": trail_sl,
             "trail_active": BOT_STATE.get("trail_active", False),
             "peak_price": BOT_STATE.get("peak_price", 0.0),
@@ -147,7 +146,7 @@ def diag():
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-# ✨ 수동 평단 설정 엔드포인트 (pos.json 유실/무료플랜 복구용)
+# ✨ 수동 평단 설정 엔드포인트 (pos.json 유실 시 복구용)
 @app.route("/setavg", methods=["GET","POST"])
 def setavg():
     val = request.args.get("avg") or request.form.get("avg")
@@ -173,7 +172,7 @@ def setavg():
         "avg_warned": False,
         "last_trade_time": datetime.now().isoformat(),
     })
-    save_pos(avg, coin_bal)  # 텔레그램 핀에도 저장됨
+    save_pos(avg, coin_bal)
     send_telegram(f"✅ 수동 평단 설정 완료 — {COIN} avg={avg:.2f}, qty={coin_bal:.6f}")
     return jsonify({"ok": True, "avg": avg, "qty": coin_bal, "symbol": SYMBOL})
 
@@ -205,7 +204,7 @@ MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
 
-# 🔒 영구 저장소(있으면 사용, 무료 플랜이면 무시돼도 OK)
+# 🔒 영구 저장소 설정 (Render 디스크 권장)
 PERSIST_DIR     = os.getenv("PERSIST_DIR", "/var/data")
 try:
     os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -215,11 +214,6 @@ except Exception as _e:
 
 CSV_FILE = os.getenv("CSV_FILE", os.path.join(PERSIST_DIR, "trades.csv"))
 POS_FILE = os.getenv("POS_FILE", os.path.join(PERSIST_DIR, "pos.json"))
-
-# 🔃 텔레그램 핀 저장/복구 + ENV 비상 복구
-TG_PIN_POS      = os.getenv("TG_PIN_POS", "true").lower() == "true"
-INIT_BUY_PRICE  = os.getenv("INIT_BUY_PRICE")  # e.g. "4407"
-INIT_BUY_QTY    = os.getenv("INIT_BUY_QTY")    # e.g. "64.380898"
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -262,8 +256,8 @@ DUST_QTY    = float(os.getenv("DUST_QTY", "1e-6"))
 SWEEP_RETRY = int(os.getenv("SWEEP_RETRY", "1"))
 
 # 포지션 복구 모드
-#   - "halt"(기본): 파일/핀/ENV 어디서도 평단 못 찾으면 거래 일시정지
-#   - "market": 현재가를 임시 평단으로 간주(권장X)
+#   - "halt"(기본): pos.json 없으면 평단 추정 금지, 거래 일시정지 + 안내
+#   - "market": 기존처럼 현재가를 임시 평단으로 간주(권장X)
 RECOVER_MODE = os.getenv("RECOVER_MODE", "halt").lower()
 
 def _mask(s, keep=4):
@@ -271,7 +265,7 @@ def _mask(s, keep=4):
     return s[:keep] + "*" * max(0, len(s) - keep)
 
 print(f"[ENV] ACCESS_KEY={_mask(ACCESS_KEY)} SECRET_KEY={_mask(SECRET_KEY)} SYMBOL={SYMBOL} COIN={COIN}")
-print(f"[ENV] PERSIST_DIR={PERSIST_DIR} POS_FILE={POS_FILE} CSV_FILE={CSV_FILE} RECOVER_MODE={RECOVER_MODE} TG_PIN_POS={TG_PIN_POS}")
+print(f"[ENV] PERSIST_DIR={PERSIST_DIR} POS_FILE={POS_FILE} CSV_FILE={CSV_FILE} RECOVER_MODE={RECOVER_MODE}")
 
 # -------------------------------
 # Shared State
@@ -318,84 +312,22 @@ def send_telegram(msg: str):
         loop.run_until_complete(_send_telegram_async(msg))
         loop.close()
 
-# --- Telegram pin persistence helpers ---
-def _tg_req(method, data=None, params=None, timeout=8):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return None
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    try:
-        if data:
-            r = requests.post(url, data=data, timeout=timeout)
-        else:
-            r = requests.get(url, params=params, timeout=timeout)
-        return r.json()
-    except Exception:
-        return None
-
-def tg_pin_pos(buy_price: float, buy_qty: float):
-    """평단/수량을 텍스트로 보내고 그 메시지를 고정(pinned)한다."""
-    if not TG_PIN_POS:
-        return
-    text = (
-        f"[POS:{SYMBOL}]\n"
-        f"buy_price={buy_price:.8f}\n"
-        f"buy_qty={buy_qty:.8f}\n"
-        f"ts={datetime.now().isoformat()}"
-    )
-    resp = _tg_req("sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": text})
-    try:
-        mid = (resp or {}).get("result", {}).get("message_id")
-        if mid:
-            _tg_req("pinChatMessage", data={
-                "chat_id": TELEGRAM_CHAT_ID, "message_id": mid, "disable_notification": True
-            })
-    except Exception:
-        pass
-
-def tg_read_pinned_pos():
-    """핀된 메시지에서 이 심볼의 평단/수량을 복구한다. 없으면 (None, None)."""
-    if not TG_PIN_POS:
-        return (None, None)
-    resp = _tg_req("getChat", params={"chat_id": TELEGRAM_CHAT_ID})
-    text = (((resp or {}).get("result") or {}).get("pinned_message") or {}).get("text") or ""
-    if f"[POS:{SYMBOL}]" not in text:
-        return (None, None)
-    buy_price = None; buy_qty = None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("buy_price="):
-            buy_price = _to_float(line.split("=",1)[1])
-        elif line.startswith("buy_qty="):
-            buy_qty = _to_float(line.split("=",1)[1])
-    if buy_price and buy_qty and buy_price > 0 and buy_qty > 0:
-        return (buy_price, buy_qty)
-    return (None, None)
-
-def manual_pos_from_env():
-    bp = _to_float(INIT_BUY_PRICE); bq = _to_float(INIT_BUY_QTY)
-    if bp and bq and bp > 0 and bq > 0:
-        return (bp, bq)
-    return (None, None)
-
 # -------------------------------
 # CSV 저장
 # -------------------------------
 def save_trade(side, qty, avg_price, realized_krw, pnl_pct, buy_uuid, sell_uuid, ts):
     file_exists = os.path.isfile(CSV_FILE)
-    try:
-        with open(CSV_FILE, mode='a', newline='') as f:
-            w = csv.writer(f)
-            if not file_exists:
-                w.writerow([
-                    "시간", f"구분(익절/손절)", f"체결수량({COIN})", "평균체결가",
-                    "실현손익(원)","손익률(%)","BUY_UUID","SELL_UUID"
-                ])
+    with open(CSV_FILE, mode='a', newline='') as f:
+        w = csv.writer(f)
+        if not file_exists:
             w.writerow([
-                ts, side, f"{qty:.6f}", f"{avg_price:.6f}",
-                f"{realized_krw:.2f}", f"{pnl_pct:.2f}", buy_uuid or "", sell_uuid or ""
+                "시간", f"구분(익절/손절)", f"체결수량({COIN})", "평균체결가",
+                "실현손익(원)","손익률(%)","BUY_UUID","SELL_UUID"
             ])
-    except Exception as e:
-        print(f"[CSV SAVE 실패] {e}")
+        w.writerow([
+            ts, side, f"{qty:.6f}", f"{avg_price:.6f}",
+            f"{realized_krw:.2f}", f"{pnl_pct:.2f}", buy_uuid or "", sell_uuid or ""
+        ])
     try:
         send_telegram(f"[LOG] {ts} {side} qty={qty:.6f} {COIN} avg={avg_price:.2f} PnL₩={realized_krw:.0f}({pnl_pct:.2f}%)")
     except Exception:
@@ -540,7 +472,7 @@ def bullish_rebound_signal(symbol, interval):
     if abs(float(low.iloc[-2]) - look_low) > max(1e-8, look_low*0.0015):
         return False, "no swing low at -2"
 
-    if not (float(close.iloc[-2]) > float(open_.iloc[-2])):
+    if not (float(close.iloc[-2]) > float(open_.iloc[-2])):  # bullish
         return False, "last candle not bullish"
     if BREAK_PREVHIGH and not (float(close.iloc[-2]) > float(high.iloc[-3])):
         return False, "no break of prev high"
@@ -721,7 +653,7 @@ def market_sell_all(upbit):
             print("[SELL] 체결 확인 실패 (타임아웃)")
             coin_after = get_balance_float(upbit, COIN)
 
-        # 스윕 (잔여가 최소주문 이상이면 반복)
+        # 스윕
         price_now = get_price_safe(SYMBOL) or price_now
         tries = SWEEP_RETRY
         while tries > 0 and coin_after and price_now and (coin_after * price_now) >= SELL_MIN_KRW:
@@ -776,4 +708,366 @@ def load_pos():
         return None
 
 def save_pos(buy_price, buy_qty):
-    # 로컬 파일(있
+    try:
+        with open(POS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "buy_price": float(buy_price),
+                "buy_qty": float(buy_qty),
+                "time": datetime.now().isoformat()
+            }, f)
+    except Exception as e:
+        print(f"[POS SAVE 실패] {e}")
+
+def clear_pos():
+    try:
+        if os.path.exists(POS_FILE):
+            os.remove(POS_FILE)
+    except Exception as e:
+        print(f"[POS DELETE 실패] {e}")
+
+def reconcile_position(upbit):
+    coin_bal = get_balance_float(upbit, COIN)
+    price_now = get_price_safe(SYMBOL) or 0.0
+
+    # 먼지면 포지션 없음 처리
+    if is_dust(coin_bal or 0.0, price_now):
+        BOT_STATE.update({
+            "bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+            "peak_price": 0.0, "trail_active": False,
+            "avg_unknown": False, "avg_warned": False
+        })
+        clear_pos()
+        if (coin_bal or 0.0) > 0:
+            send_telegram(f"🧹 복구 중 먼지 무시: {coin_bal:.6f} {COIN} (≈₩{coin_bal*price_now:.0f})")
+        return
+
+    if not coin_bal or coin_bal <= 0:
+        BOT_STATE.update({
+            "bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+            "peak_price": 0.0, "trail_active": False,
+            "avg_unknown": False, "avg_warned": False
+        })
+        clear_pos()
+        return
+
+    pos = load_pos()
+    if pos:
+        BOT_STATE.update({
+            "bought": True,
+            "buy_price": float(pos.get("buy_price", 0.0)),
+            "buy_qty": coin_bal,
+            "avg_unknown": False,
+            "avg_warned": False
+        })
+        # 트레일 초기화
+        BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
+        BOT_STATE["trail_active"] = False
+        send_telegram(f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f} {COIN}, avg≈{BOT_STATE['buy_price']:.2f}")
+    else:
+        if RECOVER_MODE == "market":
+            # (비권장) 현재가를 임시 평단으로 간주
+            BOT_STATE.update({
+                "bought": True, "buy_price": price_now, "buy_qty": coin_bal,
+                "peak_price": price_now, "trail_active": False,
+                "avg_unknown": False, "avg_warned": False
+            })
+            save_pos(price_now, coin_bal)
+            send_telegram(f"⚠️ pos.json 없음 → 임시평단=현재가({price_now:.2f})로 설정")
+        else:
+            # 기본: 평단 미확정 상태로 거래 일시정지
+            BOT_STATE.update({
+                "bought": True, "buy_price": 0.0, "buy_qty": coin_bal,
+                "peak_price": 0.0, "trail_active": False,
+                "avg_unknown": True, "avg_warned": False
+            })
+            base = _host_url_safe()
+            guide = f"{base}setavg?avg=당신의평단" if base else "/setavg?avg=당신의평단"
+            send_telegram(
+                "⏸ pos.json 없음 + 잔고 존재 → 평단 미확정으로 거래 일시정지\n"
+                f"➡ 브라우저로 {guide}  호출해서 평단을 설정하세요."
+            )
+
+# -------------------------------
+# Daily 9AM Report
+# -------------------------------
+def _tznow():
+    if ZoneInfo:
+        try: return datetime.now(ZoneInfo(REPORT_TZ))
+        except Exception: pass
+    return datetime.now()
+
+def _read_csv_rows():
+    if not os.path.exists(CSV_FILE): return []
+    rows = []
+    with open(CSV_FILE, newline='') as f:
+        r = csv.DictReader(f)
+        for row in r: rows.append(row)
+    return rows
+
+def _flt(x, default=0.0):
+    try: return float(str(x).replace(',', ''))
+    except Exception: return default
+
+def summarize_trades(date_str=None):
+    rows = _read_csv_rows()
+    if not rows:
+        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+    filt = []
+    for row in rows:
+        ts = row.get("시간",""); day = ts[:10] if len(ts)>=10 else ""
+        if (date_str is None) or (day == date_str): filt.append(row)
+    if not filt:
+        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+    cnt = len(filt)
+    wins = sum(1 for r in filt if "익절" in r.get("구분(익절/손절)",""))
+    losses = sum(1 for r in filt if "손절" in r.get("구분(익절/손절)",""))
+    realized = sum(_flt(r.get("실현손익(원)",0)) for r in filt)
+    avg_pct = sum(_flt(r.get("손익률(%)",0)) for r in filt)/cnt if cnt else 0.0
+    winrate = (wins/cnt*100.0) if cnt else 0.0
+    return {"count":cnt,"wins":wins,"losses":losses,"realized_krw":realized,"avg_pnl_pct":avg_pct,"winrate":winrate}
+
+def build_daily_report():
+    now = _tznow()
+    today = now.date().strftime("%Y-%m-%d")
+    yesterday = (now.date()-timedelta(days=1)).strftime("%Y-%m-%d")
+    d_tot, y_tot, all_tot = summarize_trades(today), summarize_trades(yesterday), summarize_trades(None)
+    price = get_price_safe(SYMBOL)
+    if BOT_STATE["bought"] and BOT_STATE["buy_price"]>0 and price:
+        upnl_pct = (price - BOT_STATE["buy_price"]) / BOT_STATE["buy_price"] * 100.0
+        pos_line = f"보유중: 평단 {BOT_STATE['buy_price']:.2f}, 수량 {BOT_STATE['buy_qty']:.6f} {COIN}, 현가 {price:.2f}, 미실현 {upnl_pct:.2f}%"
+    else:
+        pos_line = "보유 포지션: 없음 / 또는 평단 미확정"
+    msg = (
+        f"📊 [일일 매매결산] {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_TZ})\n"
+        f"— 심볼: {SYMBOL}\n\n"
+        f"🔹 오늘({today})\n"
+        f"  · 거래수: {d_tot['count']} (승 {d_tot['wins']}/패 {d_tot['losses']}, 승률 {d_tot['winrate']:.1f}%)\n"
+        f"  · 실현손익: ₩{d_tot['realized_krw']:.0f} / 평균손익률 {d_tot['avg_pnl_pct']:.2f}%\n\n"
+        f"🔹 어제({yesterday})\n"
+        f"  · 거래수: {y_tot['count']} (승 {y_tot['wins']}/패 {y_tot['losses']}, 승률 {y_tot['winrate']:.1f}%)\n"
+        f"  · 실현손익: ₩{y_tot['realized_krw']:.0f} / 평균손익률 {y_tot['avg_pnl_pct']:.2f}%\n\n"
+        f"🔹 누적(전체)\n"
+        f"  · 총 실현손익: ₩{all_tot['realized_krw']:.0f} / 총 거래수 {all_tot['count']} (승률 {all_tot['winrate']:.1f}%)\n\n"
+        f"🔸 {pos_line}\n"
+    )
+    return msg
+
+def daily_report_scheduler():
+    send_telegram("⏰ 일일 리포트 스케줄러 시작")
+    while True:
+        try:
+            now = _tznow()
+            target = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+            if now > target: target = target + timedelta(days=1)
+            sleep_sec = (target - now).total_seconds()
+            if sleep_sec > 0:
+                time.sleep(min(sleep_sec, 60)); continue
+            now_check = _tznow()
+            if now_check.hour == REPORT_HOUR and now_check.minute == REPORT_MINUTE:
+                send_telegram(build_daily_report())
+                time.sleep(60)
+            else:
+                time.sleep(5)
+        except Exception:
+            print(f"[리포트 스케줄러 예외]\n{traceback.format_exc()}")
+            time.sleep(5)
+
+# -------------------------------
+# Main Loop & Supervisor
+# -------------------------------
+def run_bot_loop():
+    if not ACCESS_KEY or not SECRET_KEY:
+        raise RuntimeError("ACCESS_KEY/SECRET_KEY missing")
+
+    try:
+        sc, body, headers = call_accounts_raw_with_headers()
+        if sc != 200:
+            print(f"[DIAG] /v1/accounts 실패: {sc} {body}")
+            send_telegram(f"❗️업비트 인증/허용IP/레이트리밋 점검 필요: {sc}")
+            backoff_from_headers(headers)
+        else:
+            print(f"[DIAG] OK Remaining-Req: {headers.get('Remaining-Req')}")
+    except Exception as e:
+        print(f"[DIAG 예외] {e}")
+
+    upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+    reconcile_position(upbit)
+
+    send_telegram("🤖 자동매매 봇 실행됨 (Web Service)")
+    BOT_STATE["running"] = True
+
+    while True:
+        try:
+            price = get_price_safe(SYMBOL)
+            if price is None:
+                time.sleep(2); continue
+
+            # --- Entry (우선순위: 얼리 V → 반등 초입 → 추세 지속) ---
+            if not BOT_STATE["bought"]:
+                ok, why = (False, None)
+
+                if EARLY_REBOUND:
+                    ok, why = early_rebound_signal(SYMBOL, MA_INTERVAL)
+
+                if not ok:
+                    ok, why = bullish_rebound_signal(SYMBOL, MA_INTERVAL)
+
+                if not ok and CONT_REENTRY:
+                    ok, why = continuation_signal(SYMBOL, MA_INTERVAL)
+
+                if not ok:
+                    time.sleep(2); continue
+
+                try:
+                    ok_ma, last_close, s_now, l_now = get_ma_values_cached()
+                    send_telegram(
+                        "🔔 매수 신호 감지\n"
+                        f"- MA: last={last_close if last_close else 0:.2f}, "
+                        f"SMA{MA_SHORT}={(s_now if s_now else 0):.2f}, "
+                        f"SMA{MA_LONG}={(l_now if l_now else 0):.2f}\n"
+                        f"- 이유: {why}"
+                    )
+                except Exception:
+                    pass
+
+                avg_buy, qty, buuid = market_buy_all(upbit)
+                if avg_buy is not None and qty and qty > 0:
+                    BOT_STATE.update({
+                        "bought": True,
+                        "buy_price": avg_buy,
+                        "buy_qty": qty,
+                        "last_trade_time": datetime.now().isoformat(),
+                        "last_signal_time": datetime.now().isoformat(),
+                        "last_signal_reason": why,
+                        "peak_price": avg_buy,
+                        "trail_active": False,
+                        "avg_unknown": False,
+                        "avg_warned": False,
+                    })
+                    save_pos(avg_buy, qty)
+
+                    tp = avg_buy * (1 + PROFIT_RATIO)
+                    sl = avg_buy * (1 - LOSS_RATIO)
+                    rr = (PROFIT_RATIO / LOSS_RATIO) if LOSS_RATIO > 0 else 0.0
+                    send_telegram(
+                        "📥 매수 진입!\n"
+                        f"평단: {avg_buy:.2f} / 수량: {qty:.6f} {COIN}\n"
+                        f"🎯 TP: {tp:.2f} (+{PROFIT_RATIO*100:.2f}%) | 🛑 SL: {sl:.2f} (-{LOSS_RATIO*100:.2f}%)\n"
+                        f"R:R ≈ {rr:.2f}:1"
+                    )
+                else:
+                    time.sleep(8)
+                continue
+
+            # --- Exit: TP/SL (+ trailing) ---
+            # 평단 미확정이면 거래 일시정지(오버셀 방지)
+            if BOT_STATE.get("avg_unknown", False) or BOT_STATE["buy_price"] <= 0:
+                if not BOT_STATE.get("avg_warned", False):
+                    base = _host_url_safe()
+                    guide = f"{base}setavg?avg=당신의평단" if base else "/setavg?avg=당신의평단"
+                    send_telegram(
+                        "⏸ 평단 미확정 상태라 청산/트레일링을 중지합니다.\n"
+                        f"➡ 브라우저로 {guide}  호출해서 평단을 설정하세요."
+                    )
+                    BOT_STATE["avg_warned"] = True
+                time.sleep(3)
+                continue
+
+            buy_price = BOT_STATE["buy_price"]
+            tp = buy_price * (1 + PROFIT_RATIO)
+            base_sl = buy_price * (1 - LOSS_RATIO)
+
+            BOT_STATE["peak_price"] = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price)
+
+            if USE_TRAIL and not BOT_STATE.get("trail_active", False):
+                if price >= buy_price * (1 + LOSS_RATIO * ARM_AFTER_R):
+                    BOT_STATE["trail_active"] = True
+                    send_telegram(f"🛡️ 트레일링 활성화: peak={BOT_STATE['peak_price']:.2f}, trail={TRAIL_PCT*100:.2f}%")
+
+            dyn_sl = base_sl
+            if USE_TRAIL and BOT_STATE.get("trail_active", False):
+                trail_sl = BOT_STATE["peak_price"] * (1 - TRAIL_PCT)
+                dyn_sl = max(base_sl, trail_sl)
+
+            if price >= tp or price <= dyn_sl:
+                avg_sell, qty_sold, realized_krw, suuid = market_sell_all(upbit)
+                if avg_sell is not None and qty_sold and qty_sold > 0:
+                    pnl_pct = ((avg_sell - buy_price) / buy_price) * 100.0 if buy_price else 0.0
+                    is_win = price >= tp
+                    tag = "🎯 익절!" if is_win else ("🛡️ 트레일링 청산" if USE_TRAIL and price > base_sl else "💥 손절!")
+                    send_telegram(f"{tag} 매도가 평균가: {avg_sell:.2f} / 수량: {qty_sold:.6f} {COIN}")
+
+                    save_trade(
+                        side=("익절" if is_win else "손절"),
+                        qty=qty_sold,
+                        avg_price=avg_sell,
+                        realized_krw=realized_krw,
+                        pnl_pct=pnl_pct,
+                        buy_uuid=None,
+                        sell_uuid=suuid,
+                        ts=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    )
+                    BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+                                      "last_trade_time": datetime.now().isoformat(),
+                                      "peak_price": 0.0, "trail_active": False,
+                                      "avg_unknown": False, "avg_warned": False})
+                    clear_pos()
+                else:
+                    ok_sell, why_not = check_sell_eligibility(price)
+                    if not ok_sell:
+                        coin_now = get_balance_float(upbit, COIN)
+                        if is_dust(coin_now or 0.0, price):
+                            send_telegram(f"🧹 매도 실패했지만 먼지 잔고라 포지션 종료 처리: {coin_now or 0.0:.6f} {COIN}")
+                            BOT_STATE.update({"bought": False, "buy_price": 0.0, "buy_qty": 0.0,
+                                              "last_trade_time": datetime.now().isoformat(),
+                                              "peak_price": 0.0, "trail_active": False,
+                                              "avg_unknown": False, "avg_warned": False})
+                            clear_pos()
+                        else:
+                            send_telegram(f"⚠️ 매도 불가: {why_not}")
+                    time.sleep(8)
+
+        except TypeError:
+            print(f"[❗TypeError]\n{traceback.format_exc()}")
+            BOT_STATE["last_error"] = "TypeError in loop"
+            time.sleep(3)
+
+        except Exception:
+            print(f"[❗루프 예외]\n{traceback.format_exc()}")
+            BOT_STATE["last_error"] = "Loop Exception"
+            raise
+
+        time.sleep(2)
+
+def supervisor():
+    while True:
+        try:
+            run_bot_loop()
+        except Exception:
+            send_telegram("⚠️ 자동매매 루프 예외로 재시작합니다.")
+            time.sleep(5); continue
+
+# -------------------------------
+# Import-time start
+# -------------------------------
+if not getattr(app, "_bot_started", False):
+    threading.Thread(target=supervisor, daemon=True).start()
+    app._bot_started = True
+    print("[BOOT] Supervisor thread started at import")
+
+if not getattr(app, "_report_started", False):
+    threading.Thread(target=daily_report_scheduler, daemon=True).start()
+    app._report_started = True
+    print("[BOOT] Daily report thread started at import")
+
+if __name__ == "__main__":
+    if not getattr(app, "_bot_started", False):
+        threading.Thread(target=supervisor, daemon=True).start()
+        app._bot_started = True
+        print("[BOOT] Supervisor thread started via __main__")
+    if not getattr(app, "_report_started", False):
+        threading.Thread(target=daily_report_scheduler, daemon=True).start()
+        app._report_started = True
+        print("[BOOT] Daily report thread started via __main__")
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
