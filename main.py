@@ -1,7 +1,7 @@
 # main.py — Upbit Bot
 # (Rebound + Early V-Rebound + Continuation Re-entry + Trailing Stop
 #  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore
-#  + Persistent Disk + Manual avg setter)
+#  + Persistent Disk + Manual avg setter + Report catch-up)
 
 import os
 import time
@@ -214,6 +214,7 @@ except Exception as _e:
 
 CSV_FILE = os.getenv("CSV_FILE", os.path.join(PERSIST_DIR, "trades.csv"))
 POS_FILE = os.getenv("POS_FILE", os.path.join(PERSIST_DIR, "pos.json"))
+REPORT_SENT_FILE = os.path.join(PERSIST_DIR, "last_report_date.txt")  # 리포트 캐치업 기록 파일
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -480,7 +481,7 @@ def bullish_rebound_signal(symbol, interval):
     if BULL_COUNT >= 2:
         for k in range(1, BULL_COUNT + 1):
             row = df.iloc[-1 - k]
-            if not (float(row["close"]) > float(row["open"])):
+            if not (float(row['close']) > float(row['open'])):
                 return False, f"need {BULL_COUNT} bullish candles"
 
     turning_up = (s_m2 > s_m3) and (s_m3 <= s_m4) if INFLECT_REQUIRE else (s_m2 > s_m3)
@@ -852,22 +853,40 @@ def build_daily_report():
     )
     return msg
 
+# 리포트 캐치업 기록
+def _get_last_report_date():
+    try:
+        with open(REPORT_SENT_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+def _set_last_report_date(date_str: str):
+    try:
+        with open(REPORT_SENT_FILE, "w", encoding="utf-8") as f:
+            f.write(date_str)
+    except Exception:
+        pass
+
 def daily_report_scheduler():
     send_telegram("⏰ 일일 리포트 스케줄러 시작")
     while True:
         try:
             now = _tznow()
-            target = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
-            if now > target: target = target + timedelta(days=1)
-            sleep_sec = (target - now).total_seconds()
-            if sleep_sec > 0:
-                time.sleep(min(sleep_sec, 60)); continue
-            now_check = _tznow()
-            if now_check.hour == REPORT_HOUR and now_check.minute == REPORT_MINUTE:
+            today = now.date().isoformat()
+            scheduled = now.replace(hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0)
+
+            # 캐치업: 9시를 이미 지났고, 오늘 아직 안 보냈으면 지금 보낸다
+            last = _get_last_report_date()
+            if (now >= scheduled) and (last != today):
                 send_telegram(build_daily_report())
-                time.sleep(60)
-            else:
-                time.sleep(5)
+                _set_last_report_date(today)
+                time.sleep(90)  # 중복 방지 쿨다운
+                continue
+
+            # 아직 시간이 안 됐으면 가볍게 대기
+            time.sleep(30)
+
         except Exception:
             print(f"[리포트 스케줄러 예외]\n{traceback.format_exc()}")
             time.sleep(5)
