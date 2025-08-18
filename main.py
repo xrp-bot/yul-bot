@@ -794,7 +794,7 @@ def load_pos():
 
 def save_pos(buy_price, buy_qty):
     try:
-        with open(POS_FILE, "w", encoding="utf-8") as f):
+        with open(POS_FILE, "w", encoding="utf-8") as f:
             json.dump({
                 "buy_price": float(buy_price),
                 "buy_qty": float(buy_qty),
