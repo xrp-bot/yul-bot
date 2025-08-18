@@ -1,5 +1,5 @@
 # main.py — Upbit Bot
-# (Rebound + Early V-Rebound + Continuation Re-entry + Trailing Stop
+# (Safe Bottom Entry + Rebound + Early V-Rebound + Continuation Re-entry + Trailing Stop
 #  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore
 #  + Persistent Disk + Manual avg setter + Report catch-up)
 
@@ -43,6 +43,11 @@ def index():
 def health():
     return jsonify({"ok": True, "ts": datetime.now().isoformat()}), 200
 
+# Render Health Check가 404 찍히지 않도록 간단한 liveness
+@app.route("/liveness")
+def liveness():
+    return "OK", 200
+
 @app.route("/status")
 def status():
     try:
@@ -52,9 +57,13 @@ def status():
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
 
         # 신호 진단(무거운 연산은 deep일 때만)
-        ok_reb = ok_con = ok_early = None
-        why_reb = why_con = why_early = None
+        ok_reb = ok_con = ok_early = ok_safe = None
+        why_reb = why_con = why_early = why_safe = None
         if deep:
+            try:
+                ok_safe, why_safe = safe_bottom_signal(SYMBOL, MA_INTERVAL) if SAFE_BOTTOM else (False, "disabled")
+            except Exception as e:
+                ok_safe, why_safe = None, f"safe_bottom_check_error: {e}"
             try:
                 ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "disabled")
             except Exception as e:
@@ -100,6 +109,8 @@ def status():
             "sma_short": sma_s,
             "sma_long": sma_l,
 
+            "signal_safe_ok": ok_safe,
+            "signal_safe_reason": why_safe,
             "signal_early_ok": ok_early,
             "signal_early_reason": why_early,
             "signal_rebound_ok": ok_reb,
@@ -261,6 +272,16 @@ SWEEP_RETRY = int(os.getenv("SWEEP_RETRY", "1"))
 #   - "market": 기존처럼 현재가를 임시 평단으로 간주(권장X)
 RECOVER_MODE = os.getenv("RECOVER_MODE", "halt").lower()
 
+# --- Safe bottom (RSI + Bollinger + Volume) ---
+SAFE_BOTTOM       = os.getenv("SAFE_BOTTOM", "true").lower() == "true"  # 안전 바닥 매수 on/off
+RSI_LEN           = int(os.getenv("RSI_LEN", "14"))
+RSI_OVERSOLD      = float(os.getenv("RSI_OVERSOLD", "30"))              # RSI 과매도 임계
+BB_LEN            = int(os.getenv("BB_LEN", "20"))                      # 볼린저 기간
+BB_K              = float(os.getenv("BB_K", "2.0"))                     # 표준편차 배수
+VOL_SAFE_BOOST    = float(os.getenv("VOL_SAFE_BOOST", "1.8"))           # 거래량 평균 대비 배수
+SAFE_NEAR_PCT     = float(os.getenv("SAFE_NEAR_PCT", "0.3"))            # 하단선 근접 허용(%)
+SAFE_REQUIRE_BULL = os.getenv("SAFE_REQUIRE_BULL", "true").lower() == "true"  # 해당 봉 양봉 요구 여부
+
 def _mask(s, keep=4):
     if not s: return ""
     return s[:keep] + "*" * max(0, len(s) - keep)
@@ -421,6 +442,17 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
         time.sleep(delay * (i + 1))
     return None
 
+# Wilder RSI
+def _rsi_wilder(close, length=14):
+    """Wilder RSI (EWMA). close: pandas Series"""
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.ewm(alpha=1/length, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/length, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
 # -------------------------------
 # MA (cached) — 닫힌 봉 기준
 # -------------------------------
@@ -558,6 +590,58 @@ def continuation_signal(symbol, interval):
         return False, "volume not enough"
 
     return True, f"continuation: N={CONT_N}, pullback={PB_TOUCH_S}, vol≥{VOL_CONT_BOOST}x"
+
+def safe_bottom_signal(symbol, interval):
+    """
+    안전 바닥 매수 (빨간 동그라미 영역)
+    조건(모두 충족):
+      - RSI < RSI_OVERSOLD (과매도)
+      - 볼린저 하단선 터치/근접
+      - 거래량이 평균의 VOL_SAFE_BOOST배 이상
+      - (옵션) 해당 봉이 양봉
+    사용 봉: -2 (닫힌 직전 봉)
+    """
+    cnt = max(MA_LONG + VOL_MA + BB_LEN + RSI_LEN + 10, 200)
+    df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
+    if df is None or df.empty or len(df) < max(BB_LEN, RSI_LEN, VOL_MA) + 5:
+        return False, "df insufficient"
+
+    close, open_, high, low, vol = df["close"], df["open"], df["high"], df["low"], df["volume"]
+
+    # 지표 계산
+    rsi = _rsi_wilder(close, RSI_LEN)
+    mid = close.rolling(BB_LEN).mean()
+    std = close.rolling(BB_LEN).std(ddof=0)
+    lower = mid - BB_K * std
+    vma = vol.rolling(VOL_MA).mean()
+
+    i = -2  # 닫힌 봉
+    if any(x is None for x in [rsi.iloc[i], lower.iloc[i], vma.iloc[i]]):
+        return False, "indicator nan"
+
+    cond_rsi = float(rsi.iloc[i]) < RSI_OVERSOLD
+    band_near = abs(float(close.iloc[i]) - float(lower.iloc[i])) <= float(lower.iloc[i]) * (SAFE_NEAR_PCT / 100.0)
+    band_pierce = float(low.iloc[i]) <= float(lower.iloc[i])
+    cond_band = band_near or band_pierce
+
+    cond_vol = float(vol.iloc[i]) >= float(vma.iloc[i]) * VOL_SAFE_BOOST
+    cond_bull = float(close.iloc[i]) > float(open_.iloc[i])  # 양봉
+
+    ok_bull = (cond_bull if SAFE_REQUIRE_BULL else True)
+
+    if cond_rsi and cond_band and cond_vol and ok_bull:
+        why = (f"safe_bottom: RSI{RSI_LEN}={float(rsi.iloc[i]):.1f}<{RSI_OVERSOLD}, "
+               f"BB{BB_LEN}K{BB_K} lower touch/near, "
+               f"Vol≥{VOL_SAFE_BOOST:.2f}×vma{VOL_MA}, "
+               f"{'bullish' if SAFE_REQUIRE_BULL else 'bull optional'}")
+        return True, why
+
+    reasons = []
+    if not cond_rsi: reasons.append("rsi not oversold")
+    if not cond_band: reasons.append("no band touch/near")
+    if not cond_vol: reasons.append("vol not boosted")
+    if SAFE_REQUIRE_BULL and not cond_bull: reasons.append("not bullish")
+    return False, ", ".join(reasons) if reasons else "no match"
 
 # -------------------------------
 # Sell helpers / rounding / dust
@@ -710,7 +794,7 @@ def load_pos():
 
 def save_pos(buy_price, buy_qty):
     try:
-        with open(POS_FILE, "w", encoding="utf-8") as f:
+        with open(POS_FILE, "w", encoding="utf-8") as f):
             json.dump({
                 "buy_price": float(buy_price),
                 "buy_qty": float(buy_qty),
@@ -921,11 +1005,14 @@ def run_bot_loop():
             if price is None:
                 time.sleep(2); continue
 
-            # --- Entry (우선순위: 얼리 V → 반등 초입 → 추세 지속) ---
+            # --- Entry (우선순위: 안전 바닥 → 얼리 V → 반등 초입 → 추세 지속) ---
             if not BOT_STATE["bought"]:
                 ok, why = (False, None)
 
-                if EARLY_REBOUND:
+                if SAFE_BOTTOM:
+                    ok, why = safe_bottom_signal(SYMBOL, MA_INTERVAL)
+
+                if not ok and EARLY_REBOUND:
                     ok, why = early_rebound_signal(SYMBOL, MA_INTERVAL)
 
                 if not ok:
