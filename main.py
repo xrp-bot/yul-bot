@@ -7,6 +7,7 @@
 # - Full-sell sweep & dust ignore
 # - Persistent disk support (/var/data default) + manual avg setter
 # - Report catch-up on restart
+# - ✅ Gist cloud sync for pos.json (load first, save after updates)
 
 import os
 import time
@@ -251,6 +252,11 @@ except Exception as _e:
 CSV_FILE = os.getenv("CSV_FILE", os.path.join(PERSIST_DIR, "trades.csv"))
 POS_FILE = os.getenv("POS_FILE", os.path.join(PERSIST_DIR, "pos.json"))
 REPORT_SENT_FILE = os.path.join(PERSIST_DIR, "last_report_date.txt")
+
+# ✅ Gist cloud pos sync ENV
+GIST_TOKEN = os.getenv("GIST_TOKEN")
+GIST_ID    = os.getenv("GIST_ID")
+GIST_FILE  = os.getenv("GIST_FILE", "pos.json")
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -686,117 +692,83 @@ def is_dust(qty: float, price: float | None) -> bool:
     return (qty <= DUST_QTY) or ((qty * price) < DUST_KRW)
 
 # -------------------------------
-# Orders
+# ✅ Gist Sync Helpers (ADD)
 # -------------------------------
-def market_buy_all(upbit):
+def _gist_headers():
+    if not GIST_TOKEN:
+        return {}
+    return {
+        "Authorization": f"token {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def gist_read_pos():
+    """Gist에서 pos.json을 읽어 dict로 반환. 실패/미설정 시 None"""
+    if not (GIST_TOKEN and GIST_ID and GIST_FILE):
+        return None
     try:
-        krw_before = get_krw_balance_safely(upbit)
-        coin_before = get_balance_float(upbit, COIN)
-        if krw_before is None or krw_before <= SELL_MIN_KRW:
-            print("[BUY] KRW 부족 또는 조회 실패:", krw_before)
-            return None, None, None
-
-        spend = krw_before * 0.9990
-        r = upbit.buy_market_order(SYMBOL, spend)
-        buy_uuid = _extract_uuid(r)
-        if buy_uuid is None:
-            print("[BUY] 주문 실패 응답:", r); return None, None, None
-        print(f"[BUY] 주문 전송 - KRW 사용 예정: {spend:.2f}, uuid={buy_uuid}")
-
-        coin_after = wait_balance_change(lambda: get_balance_float(upbit, COIN),
-                                         coin_before, cmp="gt", timeout=30, interval=0.6)
-        if coin_after is None:
-            print("[BUY] 체결 확인 실패 (타임아웃)"); return None, None, buy_uuid
-
-        filled = coin_after - coin_before
-        krw_after = get_krw_balance_safely(upbit)
-        avg_buy = avg_price_from_balances_buy(krw_before, krw_after, filled)
-        print(f"[BUY] 체결 완료 - qty={filled:.6f} {COIN}, avg={avg_buy:.6f}")
-        return avg_buy, filled, buy_uuid
-
-    except Exception:
-        print(f"[BUY 예외]\n{traceback.format_exc()}")
-        BOT_STATE["last_error"] = f"BUY: {traceback.format_exc()}"
-        return None, None, None
-
-def market_sell_all(upbit):
-    try:
-        coin_before = get_balance_float(upbit, COIN)
-        krw_before = get_krw_balance_safely(upbit)
-        price_now  = get_price_safe(SYMBOL)
-
-        if coin_before is None or coin_before <= 0:
-            print(f"[SELL] {COIN} 부족 또는 조회 실패:", coin_before); return None, None, None, None
-        if price_now is None:
-            print("[SELL] 현재가 조회 실패"); return None, None, None, None
-
-        est_krw = coin_before * price_now
-        if est_krw < SELL_MIN_KRW:
-            msg = f"[SELL] 최소 주문금액 미만: 보유 평가 {est_krw:.0f}원 < {SELL_MIN_KRW:.0f}원"
-            print(msg); send_telegram(msg)
-            if is_dust(coin_before, price_now):
-                send_telegram(f"🧹 매도불가 먼지 잔고 무시 처리: {coin_before:.6f} {COIN} (≈₩{coin_before*price_now:.0f})")
-            return None, None, None, None
-
-        vol = round_volume(coin_before)
-        r = upbit.sell_market_order(SYMBOL, vol)
-        sell_uuid = _extract_uuid(r)
-        if sell_uuid is None:
-            print("[SELL] 주문 실패 응답:", r); return None, None, None, None
-        print(f"[SELL] 주문 전송 - qty={vol:.6f} {COIN}, uuid={sell_uuid}")
-
-        coin_after = wait_balance_change(lambda: get_balance_float(upbit, COIN),
-                                         coin_before, cmp="lt", timeout=30, interval=0.6)
-        if coin_after is None:
-            print("[SELL] 체결 확인 실패 (타임아웃)")
-            coin_after = get_balance_float(upbit, COIN)
-
-        # 스윕
-        price_now = get_price_safe(SYMBOL) or price_now
-        tries = SWEEP_RETRY
-        while tries > 0 and coin_after and price_now and (coin_after * price_now) >= SELL_MIN_KRW:
-            vol2 = round_volume(coin_after)
-            if vol2 <= 0:
-                break
-            r2 = upbit.sell_market_order(SYMBOL, vol2)
-            _ = _extract_uuid(r2)
-            print(f"[SELL] 추가 스윕 매도 - qty={vol2:.6f} {COIN}")
-            coin_after2 = wait_balance_change(lambda: get_balance_float(upbit, COIN),
-                                              coin_after, cmp="lt", timeout=20, interval=0.5)
-            coin_after = coin_after2 if coin_after2 is not None else get_balance_float(upbit, COIN)
-            tries -= 1
-
-        # 정산
-        krw_after = get_krw_balance_safely(upbit)
-        filled = (coin_before - (coin_after or 0.0)) if coin_before is not None else None
-        avg_sell = (avg_price_from_balances_sell(krw_before, krw_after, filled)
-                    if (krw_before is not None and krw_after is not None and filled) else None)
-        realized_krw = (krw_after - krw_before) if (krw_after is not None and krw_before is not None) else 0.0
-        avg_sell_str = f"{(avg_sell if avg_sell is not None else 0.0):.6f}"
-        print(f"[SELL] 체결 완료 - filled={filled:.6f} {COIN} avg={avg_sell_str} pnl₩={realized_krw:.2f}")
-
-        if is_dust(coin_after or 0.0, price_now) and (coin_after or 0.0) > 0:
-            send_telegram(f"🧹 미미한 잔여 무시 처리: {(coin_after or 0.0):.6f} {COIN} (≈₩{(coin_after or 0.0)*price_now:.0f})")
-
-        return avg_sell, filled, realized_krw, sell_uuid
-
-    except Exception:
-        print(f"[SELL 예외]\n{traceback.format_exc()}")
-        BOT_STATE["last_error"] = f"SELL: {traceback.format_exc()}"
-        return None, None, None, None
-
-def _extract_uuid(r):
-    if isinstance(r, dict):
-        if "error" in r:
-            print(f"[UPBIT ORDER ERROR] {r['error']}")
+        print("[PERSIST] Trying to load pos.json from Gist...")
+        r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), timeout=10)
+        if r.status_code != 200:
+            print(f"[PERSIST] Gist GET failed: {r.status_code}")
             return None
-        return r.get("uuid")
-    return None
+        files = (r.json() or {}).get("files") or {}
+        meta = files.get(GIST_FILE)
+        if not meta:
+            print("[PERSIST] Gist file missing")
+            return None
+        content = meta.get("content")
+        if not content:
+            print("[PERSIST] Gist content empty")
+            return None
+        pos = json.loads(content)
+        # 구( avg/amount ) 구조 호환
+        if "avg" in pos and "amount" in pos and "buy_price" not in pos:
+            pos = {
+                "buy_price": float(pos.get("avg") or 0.0),
+                "buy_qty": float(pos.get("amount") or 0.0),
+                "peak_price": float(pos.get("avg") or 0.0),
+                "trail_active": bool(pos.get("trail_active", False)),
+                "time": pos.get("timestamp") or datetime.now().isoformat(),
+            }
+        print(f"[PERSIST] Gist load OK → buy_price={pos.get('buy_price')}, buy_qty={pos.get('buy_qty')}")
+        return pos
+    except Exception as e:
+        print(f"[PERSIST] Gist read exception: {e}")
+        return None
+
+def gist_write_pos(payload: dict):
+    """pos를 Gist에 저장. 성공 True/실패 False"""
+    if not (GIST_TOKEN and GIST_ID and GIST_FILE):
+        return False
+    try:
+        print(f"[PERSIST] Writing pos.json to Gist (ID={GIST_ID})...")
+        patch_body = {"files": {GIST_FILE: {"content": json.dumps(payload, ensure_ascii=False, indent=2)}}}
+        r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=_gist_headers(), json=patch_body, timeout=10)
+        ok = 200 <= r.status_code < 300
+        print("[PERSIST] Gist write OK" if ok else f"[PERSIST] Gist write failed: {r.status_code} {r.text[:120]}")
+        return ok
+    except Exception as e:
+        print(f"[PERSIST] Gist write exception: {e}")
+        return False
 
 # -------------------------------
-# Position persistence
+# Position persistence (Gist 우선)
 # -------------------------------
 def load_pos():
+    # 1) Gist 우선
+    pos = gist_read_pos()
+    if pos:
+        try:
+            with open(POS_FILE, "w", encoding="utf-8") as f:
+                json.dump(pos, f)
+            print(f"[PERSIST] Synced Gist → local {POS_FILE}")
+        except Exception as e:
+            print(f"[PERSIST] Local write failed: {e}")
+        return pos
+
+    # 2) 로컬 보조
     if not os.path.exists(POS_FILE):
         return None
     try:
@@ -806,17 +778,23 @@ def load_pos():
         return None
 
 def save_pos(buy_price, buy_qty):
+    payload = {
+        "buy_price": float(buy_price),
+        "buy_qty": float(buy_qty),
+        "peak_price": float(BOT_STATE.get("peak_price", buy_price) or buy_price),
+        "trail_active": bool(BOT_STATE.get("trail_active", False)),
+        "time": datetime.now().isoformat()
+    }
+    # 1) 로컬 저장
     try:
         with open(POS_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "buy_price": float(buy_price),
-                "buy_qty": float(buy_qty),
-                "peak_price": float(BOT_STATE.get("peak_price", buy_price) or buy_price),
-                "trail_active": bool(BOT_STATE.get("trail_active", False)),
-                "time": datetime.now().isoformat()
-            }, f)
+            json.dump(payload, f)
+        print(f"[PERSIST] Local pos saved → buy_price={payload['buy_price']}, buy_qty={payload['buy_qty']}")
     except Exception as e:
         print(f"[POS SAVE 실패] {e}")
+
+    # 2) Gist 업로드(실패해도 로컬은 유지)
+    gist_write_pos(payload)
 
 def clear_pos():
     try:
@@ -916,13 +894,13 @@ def _flt(x, default=0.0):
 def summarize_trades(date_str=None):
     rows = _read_csv_rows()
     if not rows:
-        return {"count":0,"wins":0,"losses":0.0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
     filt = []
     for row in rows:
         ts = row.get("시간",""); day = ts[:10] if len(ts)>=10 else ""
         if (date_str is None) or (day == date_str): filt.append(row)
     if not filt:
-        return {"count":0,"wins":0,"losses":0.0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
     cnt = len(filt)
     wins = sum(1 for r in filt if "익절" in r.get("구분(익절/손절)",""))
     losses = sum(1 for r in filt if "손절" in r.get("구분(익절/손절)",""))
@@ -1211,15 +1189,17 @@ def supervisor():
 @app.route("/envcheck")
 def envcheck():
     try:
-        # 토큰은 노출 금지: 존재 여부만 True/False로 표시
         gist_token_val = os.getenv("GIST_TOKEN")
         gist_token_ok = (gist_token_val is not None) and (len(gist_token_val) > 10)
         gist_id_val = os.getenv("GIST_ID")
         resp = {
             "ok": True,
             "env": {
+                "has_gist_token": bool(gist_token_ok),
+                "has_gist_id": bool(bool(gist_id_val)),
                 "GIST_TOKEN_present": bool(gist_token_ok),
                 "GIST_ID": gist_id_val,
+                "GIST_FILE": os.getenv("GIST_FILE", "pos.json"),
                 "PERSIST_DIR": PERSIST_DIR,
                 "SYMBOL": SYMBOL,
             }
@@ -1227,7 +1207,6 @@ def envcheck():
         return jsonify(resp), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.route("/poscheck")
 def poscheck():
