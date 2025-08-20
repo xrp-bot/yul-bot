@@ -916,13 +916,13 @@ def _flt(x, default=0.0):
 def summarize_trades(date_str=None):
     rows = _read_csv_rows()
     if not rows:
-        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+        return {"count":0,"wins":0,"losses":0.0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
     filt = []
     for row in rows:
         ts = row.get("시간",""); day = ts[:10] if len(ts)>=10 else ""
         if (date_str is None) or (day == date_str): filt.append(row)
     if not filt:
-        return {"count":0,"wins":0,"losses":0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
+        return {"count":0,"wins":0,"losses":0.0,"realized_krw":0.0,"avg_pnl_pct":0.0,"winrate":0.0}
     cnt = len(filt)
     wins = sum(1 for r in filt if "익절" in r.get("구분(익절/손절)",""))
     losses = sum(1 for r in filt if "손절" in r.get("구분(익절/손절)",""))
@@ -1205,6 +1205,56 @@ def supervisor():
             time.sleep(5); continue
 
 # -------------------------------
+# === Env / POS 체크 유틸 라우트 ===
+# (※ 반드시 __main__ 블록 이전에 선언되어야 서버 시작 시 등록됩니다)
+# -------------------------------
+@app.route("/envcheck")
+def envcheck():
+    try:
+        # 토큰은 노출 금지: 존재 여부만 True/False로 표시
+        gist_token_val = os.getenv("GIST_TOKEN")
+        gist_token_ok = (gist_token_val is not None) and (len(gist_token_val) > 10)
+        gist_id_val = os.getenv("GIST_ID")
+        resp = {
+            "ok": True,
+            "env": {
+                "GIST_TOKEN_present": bool(gist_token_ok),
+                "GIST_ID": gist_id_val,
+                "PERSIST_DIR": PERSIST_DIR,
+                "SYMBOL": SYMBOL,
+            }
+        }
+        return jsonify(resp), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/poscheck")
+def poscheck():
+    """
+    현재 인식된 포지션(pos.json) 상태를 보여줍니다.
+    - Gist 연동을 적용했다면, cloud에서 불러온 값이 반영됩니다(기존 load_pos() 사용).
+    - pos가 없거나 평단 미확정이면 그 상태를 그대로 표시합니다.
+    """
+    try:
+        pos = load_pos()
+        data = {
+            "ok": True,
+            "bought_state": {
+                "bought": BOT_STATE.get("bought"),
+                "buy_price": BOT_STATE.get("buy_price"),
+                "buy_qty": BOT_STATE.get("buy_qty"),
+                "avg_unknown": BOT_STATE.get("avg_unknown"),
+                "trail_active": BOT_STATE.get("trail_active"),
+                "peak_price": BOT_STATE.get("peak_price"),
+            },
+            "pos_file": pos if pos else None
+        }
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# -------------------------------
 # Import-time start
 # -------------------------------
 if not getattr(app, "_bot_started", False):
@@ -1217,6 +1267,9 @@ if not getattr(app, "_report_started", False):
     app._report_started = True
     print("[BOOT] Daily report thread started at import")
 
+# -------------------------------
+# __main__ (앱 실행)
+# -------------------------------
 if __name__ == "__main__":
     if not getattr(app, "_bot_started", False):
         threading.Thread(target=supervisor, daemon=True).start()
