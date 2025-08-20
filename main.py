@@ -1,8 +1,12 @@
-# main.py — Upbit Bot (Optimized)
-# (Pivot-first Entry + Early V + Rebound + Continuation
-#  + Trailing Stop with Floating TP
-#  + Durable Position + Daily Report + Safe /status + Full-sell Sweep & Dust Ignore
-#  + Persistent Disk + Manual avg setter + Report catch-up + /liveness)
+# main.py — Yul Upbit Bot (All-in-One)
+# Features:
+# - Entry: Pivot Rebound (RSI+BB+Volume) + Early V + Rebound + Continuation (ENTRY_MODE)
+# - Trailing Stop w/ optional floating TP
+# - Durable position (pos.json) incl. peak/trail persistence (survives restarts)
+# - Daily report, Safe /status, /liveness
+# - Full-sell sweep & dust ignore
+# - Persistent disk support (/var/data default) + manual avg setter
+# - Report catch-up on restart
 
 import os
 import time
@@ -16,8 +20,6 @@ import asyncio
 import traceback
 import uuid
 import jwt
-import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, has_request_context
 
@@ -32,7 +34,6 @@ except Exception:
 app = Flask(__name__)
 
 def _host_url_safe() -> str:
-    """요청 컨텍스트가 없을 때도 안전하게 host_url을 제공."""
     try:
         return request.host_url if has_request_context() else ""
     except Exception:
@@ -46,14 +47,10 @@ def index():
 def health():
     return jsonify({"ok": True, "ts": datetime.now().isoformat()}), 200
 
-# Render 헬스체크용 (404 방지)
+# Render Health Check용
 @app.route("/liveness")
 def liveness():
-    return jsonify({
-        "ok": True,
-        "ts": datetime.now().isoformat(),
-        "running": BOT_STATE.get("running", False)
-    }), 200
+    return jsonify({"ok": True}), 200
 
 @app.route("/status")
 def status():
@@ -64,19 +61,18 @@ def status():
         ok_ma, last_close, sma_s, sma_l = get_ma_values_cached()
 
         # 신호 진단(무거운 연산은 deep일 때만)
-        ok_reb = ok_con = ok_early = ok_pivot = None
-        why_reb = why_con = why_early = why_pivot = None
+        ok_piv = ok_reb = ok_con = ok_early = None
+        why_piv = why_reb = why_con = why_early = None
         if deep:
             try:
                 if USE_PIVOT:
-                    ok_pivot, why_pivot = pivot_rebound_signal(SYMBOL, MA_INTERVAL)
+                    ok_piv, why_piv = pivot_rebound_signal(SYMBOL, MA_INTERVAL)
                 else:
-                    ok_pivot, why_pivot = (False, "pivot disabled")
+                    ok_piv, why_piv = (False, "pivot disabled")
             except Exception as e:
-                ok_pivot, why_pivot = None, f"pivot_check_error: {e}"
-
+                ok_piv, why_piv = None, f"pivot_check_error: {e}"
             try:
-                ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "disabled")
+                ok_early, why_early = early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "early disabled")
             except Exception as e:
                 ok_early, why_early = None, f"early_check_error: {e}"
             try:
@@ -84,7 +80,7 @@ def status():
             except Exception as e:
                 ok_reb, why_reb = None, f"rebound_check_error: {e}"
             try:
-                ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL) if CONT_REENTRY else (False, "disabled")
+                ok_con, why_con = continuation_signal(SYMBOL, MA_INTERVAL) if CONT_REENTRY else (False, "cont disabled")
             except Exception as e:
                 ok_con, why_con = None, f"cont_check_error: {e}"
 
@@ -92,9 +88,10 @@ def status():
         can_sell = None
         cannot_reason = None
         if BOT_STATE["bought"] and BOT_STATE["buy_price"] > 0 and price:
-            tp = BOT_STATE["buy_price"] * (1 + PROFIT_RATIO)
+            base_tp = BOT_STATE["buy_price"] * (1 + PROFIT_RATIO)
             sl = BOT_STATE["buy_price"] * (1 - LOSS_RATIO)
 
+            # 트레일 활성 시 동적 SL
             if USE_TRAIL and BOT_STATE.get("trail_active", False):
                 peak = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price or 0.0)
                 trail_sl = peak * (1 - TRAIL_PCT)
@@ -102,7 +99,14 @@ def status():
             else:
                 dyn_sl = sl
 
-            gap_tp = ((tp - price) / BOT_STATE["buy_price"]) * 100.0
+            # 트레일 중 TP 떠다니기 옵션: 켜져있으면 TP 사실상 해제
+            if USE_TRAIL and BOT_STATE.get("trail_active", False) and FLOAT_TP_WHEN_TRAIL:
+                tp = None
+                gap_tp = None
+            else:
+                tp = base_tp
+                gap_tp = ((tp - price) / BOT_STATE["buy_price"]) * 100.0
+
             gap_sl = ((price - (dyn_sl or sl)) / BOT_STATE["buy_price"]) * 100.0
 
             if deep:
@@ -120,8 +124,8 @@ def status():
             "sma_short": sma_s,
             "sma_long": sma_l,
 
-            "signal_pivot_ok": ok_pivot,
-            "signal_pivot_reason": why_pivot,
+            "signal_pivot_ok": ok_piv,
+            "signal_pivot_reason": why_piv,
             "signal_early_ok": ok_early,
             "signal_early_reason": why_early,
             "signal_rebound_ok": ok_reb,
@@ -217,8 +221,18 @@ def base_coin(sym: str) -> str:
 
 COIN = base_coin(SYMBOL)
 
-PROFIT_RATIO    = float(os.getenv("PROFIT_RATIO", "0.02"))  # TP +2%
-LOSS_RATIO      = float(os.getenv("LOSS_RATIO",   "0.01"))  # SL -1%
+# Entry mode & Pivot configs
+ENTRY_MODE          = os.getenv("ENTRY_MODE", "hybrid").lower()   # pivot | trend | hybrid
+USE_PIVOT           = os.getenv("USE_PIVOT", "true").lower() == "true"
+
+RSI_LEN             = int(os.getenv("RSI_LEN", "14"))
+RSI_BUY             = float(os.getenv("RSI_BUY", "33"))           # RSI ≤ RSI_BUY 구간
+RSI_BOUNCE_GAP      = float(os.getenv("RSI_BOUNCE_GAP", "2.0"))   # RSI 반등 폭
+BB_STD              = float(os.getenv("BB_STD", "2.0"))           # 볼밴 표준편차
+PIVOT_VOL_BOOST     = float(os.getenv("PIVOT_VOL_BOOST", "1.05")) # 거래량 배수
+
+PROFIT_RATIO        = float(os.getenv("PROFIT_RATIO", "0.03"))    # TP +3%
+LOSS_RATIO          = float(os.getenv("LOSS_RATIO",   "0.01"))    # SL -1%
 
 # MA/Interval
 MA_INTERVAL     = os.getenv("MA_INTERVAL", "minute1")
@@ -226,24 +240,7 @@ MA_SHORT        = int(os.getenv("MA_SHORT", "5"))
 MA_LONG         = int(os.getenv("MA_LONG", "20"))
 MA_REFRESH_SEC  = int(os.getenv("MA_REFRESH_SEC", "30"))
 
-# --- Pivot(빨간 동그라미) 진입 옵션 ---
-ENTRY_MODE      = os.getenv("ENTRY_MODE", "hybrid").lower()  # "trend" | "pivot" | "hybrid"
-USE_PIVOT       = os.getenv("USE_PIVOT", "true").lower() == "true"
-
-# RSI / 볼린저 / 거래량(피벗용)
-RSI_LEN         = int(os.getenv("RSI_LEN", "14"))
-RSI_BUY         = float(os.getenv("RSI_BUY", "33"))    # RSI가 이 값 "이하"였다가 반등 시작
-RSI_BOUNCE_GAP  = float(os.getenv("RSI_BOUNCE_GAP", "2.0"))  # 이전 값 대비 최소 반등폭
-BB_STD          = float(os.getenv("BB_STD", "2.0"))    # 볼린저 표준편차
-PIVOT_VOL_BOOST = float(os.getenv("PIVOT_VOL_BOOST", "1.05"))  # 최근 평균 대비 거래량 배수
-
-# 트레일링 시 TP 고정 해제(이익 극대화)
-USE_TRAIL       = os.getenv("USE_TRAIL", "true").lower() == "true"
-TRAIL_PCT       = float(os.getenv("TRAIL_PCT", "0.015"))
-ARM_AFTER_R     = float(os.getenv("ARM_AFTER_R", "1.0"))
-FLOAT_TP_WHEN_TRAIL = os.getenv("FLOAT_TP_WHEN_TRAIL", "true").lower() == "true"
-
-# 🔒 영구 저장소 설정 (Render 디스크 권장)
+# 🔒 영구 저장소 (Render 디스크 권장: /var/data)
 PERSIST_DIR     = os.getenv("PERSIST_DIR", "/var/data")
 try:
     os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -253,7 +250,7 @@ except Exception as _e:
 
 CSV_FILE = os.getenv("CSV_FILE", os.path.join(PERSIST_DIR, "trades.csv"))
 POS_FILE = os.getenv("POS_FILE", os.path.join(PERSIST_DIR, "pos.json"))
-REPORT_SENT_FILE = os.path.join(PERSIST_DIR, "last_report_date.txt")  # 리포트 캐치업 기록 파일
+REPORT_SENT_FILE = os.path.join(PERSIST_DIR, "last_report_date.txt")
 
 # Rebound entry tuning
 BULL_COUNT      = int(os.getenv("BULL_COUNT", "1"))
@@ -276,6 +273,12 @@ CONT_N          = int(os.getenv("CONT_N", "5"))
 PB_TOUCH_S      = os.getenv("PB_TOUCH_S", "true").lower() == "true"
 VOL_CONT_BOOST  = float(os.getenv("VOL_CONT_BOOST", "1.00"))
 
+# Trailing stop
+USE_TRAIL           = os.getenv("USE_TRAIL", "true").lower() == "true"
+TRAIL_PCT           = float(os.getenv("TRAIL_PCT", "0.015"))     # 1.5%
+ARM_AFTER_R         = float(os.getenv("ARM_AFTER_R", "1.0"))     # +1R에서 트레일 암
+FLOAT_TP_WHEN_TRAIL = os.getenv("FLOAT_TP_WHEN_TRAIL", "true").lower() == "true"
+
 # Daily report
 REPORT_TZ      = os.getenv("REPORT_TZ", "Asia/Seoul")
 REPORT_HOUR    = int(os.getenv("REPORT_HOUR", "9"))
@@ -291,8 +294,8 @@ DUST_QTY    = float(os.getenv("DUST_QTY", "1e-6"))
 SWEEP_RETRY = int(os.getenv("SWEEP_RETRY", "1"))
 
 # 포지션 복구 모드
-#   - "halt"(기본): pos.json 없으면 평단 추정 금지, 거래 일시정지 + 안내
-#   - "market": 현재가를 임시 평단으로 간주(권장X)
+#   - "halt"(기본): pos.json 없으면 평단 미확정으로 멈추고 /setavg 안내
+#   - "market": pos.json 없으면 현재가를 임시 평단(권장X)
 RECOVER_MODE = os.getenv("RECOVER_MODE", "halt").lower()
 
 def _mask(s, keep=4):
@@ -458,23 +461,16 @@ def get_ohlcv_safe(symbol, interval, count, tries=3, delay=0.8):
 # -------------------------------
 # Indicators
 # -------------------------------
-def ta_rsi(series: "pd.Series", length: int = 14) -> "pd.Series":
-    close = series.astype(float)
-    delta = close.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).rolling(length).mean()
-    roll_down = pd.Series(down, index=series.index).rolling(length).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return pd.Series(rsi, index=series.index)
-
-def ta_bbands(series: "pd.Series", window: int = 20, num_std: float = 2.0):
-    ma = series.rolling(window).mean()
-    sd = series.rolling(window).std(ddof=0)
-    upper = ma + num_std * sd
-    lower = ma - num_std * sd
-    return ma, upper, lower
+def _rsi(series, length=14):
+    # Wilder's RSI
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    gain = up.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    loss = down.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    rs = gain / (loss + 1e-12)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 # -------------------------------
 # MA (cached) — 닫힌 봉 기준
@@ -505,6 +501,52 @@ def get_ma_values_cached():
 # -------------------------------
 # Entry Signals
 # -------------------------------
+def pivot_rebound_signal(symbol, interval):
+    """
+    피벗 반등(안전형): RSI 바닥권 반등 + 볼린저 하단 근접 + 거래량 부스트 + 아랫꼬리 조건
+    """
+    cnt = max(MA_LONG + VOL_MA + 40, 180)
+    df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
+    if df is None or df.empty or len(df) < max(RSI_LEN + VOL_MA + 5, 40):
+        return False, "df insufficient"
+
+    close, open_, high, low, vol = df["close"], df["open"], df["high"], df["low"], df["volume"]
+
+    # 닫힌 봉 기준(-2)
+    c2, o2, h2, l2, v2 = float(close.iloc[-2]), float(open_.iloc[-2]), float(high.iloc[-2]), float(low.iloc[-2]), float(vol.iloc[-2])
+
+    # RSI
+    rsi = _rsi(close, RSI_LEN)
+    rsi2 = float(rsi.iloc[-2]); rsi3 = float(rsi.iloc[-3])
+    if not (rsi2 <= RSI_BUY or rsi3 <= RSI_BUY):
+        return False, f"RSI not in buy zone ({rsi2:.1f})"
+    if (rsi2 - rsi3) < RSI_BOUNCE_GAP:
+        return False, f"RSI bounce < gap ({rsi2 - rsi3:.2f} < {RSI_BOUNCE_GAP})"
+
+    # Bollinger Bands
+    ma = close.rolling(MA_LONG).mean()
+    std = close.rolling(MA_LONG).std(ddof=0)
+    bb_mid = float(ma.iloc[-2]); bb_std = float(std.iloc[-2]) if std.iloc[-2] == std.iloc[-2] else 0.0
+    bb_low = bb_mid - BB_STD * bb_std if bb_std > 0 else bb_mid
+    # 하단선 위 0~0.4% 근접
+    if not (c2 >= bb_low and (c2 - bb_low) / max(1e-9, bb_low) <= 0.004):
+        return False, "not near BB lower band"
+
+    # Volume boost
+    vma = float(vol.rolling(VOL_MA).mean().iloc[-2])
+    if v2 < vma * PIVOT_VOL_BOOST:
+        return False, "volume not boosted"
+
+    # Bullish + long lower wick
+    if not (c2 > o2):
+        return False, "not bullish"
+    body = abs(c2 - o2) + 1e-9
+    lower_wick = min(o2, c2) - l2
+    if (lower_wick / body) < 0.6:
+        return False, "lower wick too small"
+
+    return True, f"pivot: RSI<= {RSI_BUY}, bounce≥{RSI_BOUNCE_GAP}, near BB low, vol≥{PIVOT_VOL_BOOST}x, long lower wick"
+
 def bullish_rebound_signal(symbol, interval):
     """
     반등 초입(보수형)
@@ -613,51 +655,6 @@ def continuation_signal(symbol, interval):
         return False, "volume not enough"
 
     return True, f"continuation: N={CONT_N}, pullback={PB_TOUCH_S}, vol≥{VOL_CONT_BOOST}x"
-
-def pivot_rebound_signal(symbol, interval):
-    """
-    빨간 동그라미 진입(빠른 반등) — RSI 바닥→반등 + 하단 밴드 근접 + 거래량↑ + 양봉+아랫꼬리
-    닫힌 봉(-2) 기준으로 판정하되, 지연을 줄이기 위해 설계를 타이트하게 함.
-    """
-    cnt = max( max(MA_LONG, VOL_MA, RSI_LEN, 20) + 30, 180 )
-    df = get_ohlcv_safe(symbol, interval=interval, count=cnt)
-    if df is None or df.empty or len(df) < max(MA_LONG, VOL_MA, RSI_LEN, 20) + 5:
-        return False, "df insufficient"
-
-    close, open_, high, low, vol = df["close"], df["open"], df["high"], df["low"], df["volume"]
-
-    # 지표 계산
-    rsi = ta_rsi(close, RSI_LEN)
-    ma, bb_up, bb_lo = ta_bbands(close, 20, BB_STD)
-
-    i = -2  # 닫힌 최신봉
-
-    # 1) RSI 바닥 → 반등 시작
-    if np.isnan(rsi.iloc[i]) or np.isnan(rsi.iloc[i-1]):
-        return False, "rsi nan"
-    if not (rsi.iloc[i-1] <= RSI_BUY and (rsi.iloc[i] >= rsi.iloc[i-1] + RSI_BOUNCE_GAP)):
-        return False, "rsi not bouncing from low"
-
-    # 2) 볼린저 하단 근접(0~0.4% 위)
-    if np.isnan(bb_lo.iloc[i]) or np.isnan(ma.iloc[i]):
-        return False, "bb nan"
-    if not (close.iloc[i] >= bb_lo.iloc[i] and (close.iloc[i] - bb_lo.iloc[i]) <= max(1e-8, bb_lo.iloc[i]*0.004)):
-        return False, "not near lower band"
-
-    # 3) 거래량: 최근 평균 대비 소폭↑
-    vma = float(vol.rolling(VOL_MA).mean().iloc[i])
-    if vma <= 0 or float(vol.iloc[i]) < vma * PIVOT_VOL_BOOST:
-        return False, "volume not picked up"
-
-    # 4) 형태: 양봉 + 아랫꼬리(몸통의 60% 이상)
-    if not (float(close.iloc[i]) > float(open_.iloc[i])):
-        return False, "not bullish candle"
-    body = abs(float(close.iloc[i]) - float(open_.iloc[i])) + 1e-9
-    lower_wick = min(float(open_.iloc[i]), float(close.iloc[i])) - float(low.iloc[i])
-    if (lower_wick / body) < 0.6:
-        return False, "lower wick too small"
-
-    return True, f"pivot: RSI({RSI_LEN}) bounce from ≤{RSI_BUY}, near BB low, vol>{PIVOT_VOL_BOOST}x, bullish+long lower wick"
 
 # -------------------------------
 # Sell helpers / rounding / dust
@@ -814,6 +811,8 @@ def save_pos(buy_price, buy_qty):
             json.dump({
                 "buy_price": float(buy_price),
                 "buy_qty": float(buy_qty),
+                "peak_price": float(BOT_STATE.get("peak_price", buy_price) or buy_price),
+                "trail_active": bool(BOT_STATE.get("trail_active", False)),
                 "time": datetime.now().isoformat()
             }, f)
     except Exception as e:
@@ -853,20 +852,25 @@ def reconcile_position(upbit):
 
     pos = load_pos()
     if pos:
+        # 저장된 평단/트레일 상태를 그대로 복원 (현재가로 덮어쓰기 금지)
+        buy_price_saved = float(pos.get("buy_price", 0.0) or 0.0)
         BOT_STATE.update({
             "bought": True,
-            "buy_price": float(pos.get("buy_price", 0.0)),
+            "buy_price": buy_price_saved,
             "buy_qty": coin_bal,
             "avg_unknown": False,
-            "avg_warned": False
+            "avg_warned": False,
+            "peak_price": float(pos.get("peak_price", buy_price_saved) or buy_price_saved),
+            "trail_active": bool(pos.get("trail_active", False)),
         })
-        # 트레일 초기화
-        BOT_STATE["peak_price"] = BOT_STATE["buy_price"]
-        BOT_STATE["trail_active"] = False
-        send_telegram(f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f} {COIN}, avg≈{BOT_STATE['buy_price']:.2f}")
+        send_telegram(
+            f"♻️ 포지션 복구 — qty={BOT_STATE['buy_qty']:.6f} {COIN}, "
+            f"avg≈{BOT_STATE['buy_price']:.2f}, "
+            f"peak={BOT_STATE['peak_price']:.2f}, trail={'ON' if BOT_STATE['trail_active'] else 'OFF'}"
+        )
     else:
         if RECOVER_MODE == "market":
-            # (비권장) 현재가를 임시 평단으로 간주
+            # (비권장) 현재가를 임시 평단
             BOT_STATE.update({
                 "bought": True, "buy_price": price_now, "buy_qty": coin_bal,
                 "peak_price": price_now, "trail_active": False,
@@ -875,7 +879,7 @@ def reconcile_position(upbit):
             save_pos(price_now, coin_bal)
             send_telegram(f"⚠️ pos.json 없음 → 임시평단=현재가({price_now:.2f})로 설정")
         else:
-            # 기본: 평단 미확정 상태로 거래 일시정지
+            # 기본: 평단 미확정 → 거래 일시정지 + /setavg 안내
             BOT_STATE.update({
                 "bought": True, "buy_price": 0.0, "buy_qty": coin_bal,
                 "peak_price": 0.0, "trail_active": False,
@@ -885,7 +889,7 @@ def reconcile_position(upbit):
             guide = f"{base}setavg?avg=당신의평단" if base else "/setavg?avg=당신의평단"
             send_telegram(
                 "⏸ pos.json 없음 + 잔고 존재 → 평단 미확정으로 거래 일시정지\n"
-                f"➡ 브라우저로 {guide}  호출해서 평단을 설정하세요."
+                f"➡ 브라우저로 {guide} 호출해서 평단을 설정하세요."
             )
 
 # -------------------------------
@@ -984,12 +988,36 @@ def daily_report_scheduler():
                 time.sleep(90)  # 중복 방지 쿨다운
                 continue
 
-            # 아직 시간이 안 됐으면 가볍게 대기
             time.sleep(30)
 
         except Exception:
             print(f"[리포트 스케줄러 예외]\n{traceback.format_exc()}")
             time.sleep(5)
+
+# -------------------------------
+# Entry sequence helper
+# -------------------------------
+def _entry_sequence():
+    if ENTRY_MODE == "pivot":
+        return [
+            ("pivot", pivot_rebound_signal if USE_PIVOT else None),
+            ("early", early_rebound_signal if EARLY_REBOUND else None),
+            ("rebound", bullish_rebound_signal),
+            ("cont", continuation_signal if CONT_REENTRY else None),
+        ]
+    if ENTRY_MODE == "trend":
+        return [
+            ("early", early_rebound_signal if EARLY_REBOUND else None),
+            ("rebound", bullish_rebound_signal),
+            ("cont", continuation_signal if CONT_REENTRY else None),
+        ]
+    # hybrid (default)
+    return [
+        ("pivot", pivot_rebound_signal if USE_PIVOT else None),
+        ("early", early_rebound_signal if EARLY_REBOUND else None),
+        ("rebound", bullish_rebound_signal),
+        ("cont", continuation_signal if CONT_REENTRY else None),
+    ]
 
 # -------------------------------
 # Main Loop & Supervisor
@@ -1021,37 +1049,16 @@ def run_bot_loop():
             if price is None:
                 time.sleep(2); continue
 
-            # --- Entry (우선순위: PIVOT → 얼리V → 반등초입 → 추세지속) ---
+            # --- Entry (sequence according to ENTRY_MODE) ---
             if not BOT_STATE["bought"]:
-                ok, why = (False, None)
-
-                def _try_pivot():
-                    if USE_PIVOT and ENTRY_MODE in ("pivot","hybrid"):
-                        return pivot_rebound_signal(SYMBOL, MA_INTERVAL)
-                    return (False, "pivot disabled or mode!=pivot/hybrid")
-
-                def _try_early():
-                    return early_rebound_signal(SYMBOL, MA_INTERVAL) if EARLY_REBOUND else (False, "early disabled")
-
-                def _try_rebound():
-                    return bullish_rebound_signal(SYMBOL, MA_INTERVAL)
-
-                def _try_cont():
-                    return continuation_signal(SYMBOL, MA_INTERVAL) if CONT_REENTRY else (False, "cont disabled")
-
-                # 모드에 따른 시도 순서
-                if ENTRY_MODE == "pivot":
-                    for fn in (_try_pivot, _try_early, _try_rebound, _try_cont):
-                        ok, why = fn()
-                        if ok: break
-                elif ENTRY_MODE == "trend":
-                    for fn in (_try_early, _try_rebound, _try_cont):
-                        ok, why = fn()
-                        if ok: break
-                else:  # hybrid
-                    for fn in (_try_pivot, _try_early, _try_rebound, _try_cont):
-                        ok, why = fn()
-                        if ok: break
+                ok, why, used = (False, None, None)
+                for name, fn in _entry_sequence():
+                    if fn is None:  # disabled
+                        continue
+                    ok, why = fn(SYMBOL, MA_INTERVAL)
+                    if ok:
+                        used = name
+                        break
 
                 if not ok:
                     time.sleep(2); continue
@@ -1060,6 +1067,7 @@ def run_bot_loop():
                     ok_ma, last_close, s_now, l_now = get_ma_values_cached()
                     send_telegram(
                         "🔔 매수 신호 감지\n"
+                        f"- 사용 신호: {used}\n"
                         f"- MA: last={last_close if last_close else 0:.2f}, "
                         f"SMA{MA_SHORT}={(s_now if s_now else 0):.2f}, "
                         f"SMA{MA_LONG}={(l_now if l_now else 0):.2f}\n"
@@ -1105,42 +1113,49 @@ def run_bot_loop():
                     guide = f"{base}setavg?avg=당신의평단" if base else "/setavg?avg=당신의평단"
                     send_telegram(
                         "⏸ 평단 미확정 상태라 청산/트레일링을 중지합니다.\n"
-                        f"➡ 브라우저로 {guide}  호출해서 평단을 설정하세요."
+                        f"➡ 브라우저로 {guide} 호출해서 평단을 설정하세요."
                     )
                     BOT_STATE["avg_warned"] = True
                 time.sleep(3)
                 continue
 
             buy_price = BOT_STATE["buy_price"]
-            tp = buy_price * (1 + PROFIT_RATIO)
+            base_tp = buy_price * (1 + PROFIT_RATIO)
             base_sl = buy_price * (1 - LOSS_RATIO)
 
+            # Peak 갱신
             BOT_STATE["peak_price"] = max(BOT_STATE.get("peak_price", 0.0) or 0.0, price)
 
+            # 트레일 암 조건 충족 시 켜기
             if USE_TRAIL and not BOT_STATE.get("trail_active", False):
                 if price >= buy_price * (1 + LOSS_RATIO * ARM_AFTER_R):
                     BOT_STATE["trail_active"] = True
-                    send_telegram(f"🛡️ 트레일링 활성화: peak={BOT_STATE['peak_price']:.2f}, trail={TRAIL_PCT*100:.2f}%")
+                    save_pos(buy_price, BOT_STATE["buy_qty"])  # trail_on 상태 기록
+                    msg = f"🛡️ 트레일링 활성화: peak={BOT_STATE['peak_price']:.2f}, trail={TRAIL_PCT*100:.2f}%"
+                    if FLOAT_TP_WHEN_TRAIL:
+                        msg += " (TP float: 상방 최대 추종)"
+                    send_telegram(msg)
 
+            # 동적 SL
             dyn_sl = base_sl
             if USE_TRAIL and BOT_STATE.get("trail_active", False):
                 trail_sl = BOT_STATE["peak_price"] * (1 - TRAIL_PCT)
                 dyn_sl = max(base_sl, trail_sl)
-                if FLOAT_TP_WHEN_TRAIL:
-                    # 트레일링이 켜진 후에는 고정 TP로 막히지 않게 TP를 사실상 무력화
-                    tp = float('inf')
 
-            # 청산 조건: TP(고정 또는 무력화) OR 동적 SL(트레일/기본)
-            if price >= tp or price <= dyn_sl:
+            # TP 판정 (트레일+float면 TP 해제)
+            take_profit_allowed = not (USE_TRAIL and BOT_STATE.get("trail_active", False) and FLOAT_TP_WHEN_TRAIL)
+            tp_hit = (price >= base_tp) if take_profit_allowed else False
+            sl_hit = price <= dyn_sl
+
+            if tp_hit or sl_hit:
                 avg_sell, qty_sold, realized_krw, suuid = market_sell_all(upbit)
                 if avg_sell is not None and qty_sold and qty_sold > 0:
                     pnl_pct = ((avg_sell - buy_price) / buy_price) * 100.0 if buy_price else 0.0
-                    is_win = (price >= tp) and (tp != float('inf'))
-                    tag = "🎯 익절!" if is_win else ("🛡️ 트레일링 청산" if USE_TRAIL and price > base_sl else "💥 손절!")
+                    tag = "🎯 익절!" if tp_hit else ("🛡️ 트레일링 청산" if (USE_TRAIL and price > base_sl) else "💥 손절!")
                     send_telegram(f"{tag} 매도가 평균가: {avg_sell:.2f} / 수량: {qty_sold:.6f} {COIN}")
 
                     save_trade(
-                        side=("익절" if tag.startswith("🎯") else "손절" if tag.startswith("💥") else "익절"),
+                        side=("익절" if tp_hit else "손절"),
                         qty=qty_sold,
                         avg_price=avg_sell,
                         realized_krw=realized_krw,
