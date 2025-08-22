@@ -638,3 +638,12 @@ if __name__ == "__main__":
     init_bot()
     start_threads()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+
+    # === import-time autostart for gunicorn/wsgi ===
+if not getattr(app, "_bot_started", False):
+    init_bot()
+    start_threads()
+    app._bot_started = True
+
+
+    
