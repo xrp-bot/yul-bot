@@ -1,4 +1,4 @@
-# main.py — Upbit Multi-Asset Gainer Scanner Bot (24h) — IPR + SafeOrders
+# main.py — Upbit Multi-Asset Gainer Scanner Bot (24h) — IPR + SafeOrders (fixed)
 # Spec (2025-08):
 # - 24h 급등 스캐너: 거래대금 TOPN + 10분상승률/1분 스파이크 필터
 # - IPR 진입: 고점 대비 1.5~4.0% 풀백 + EMA 상회 + 직전 고점 미세 돌파 + RSI≤70
@@ -39,7 +39,6 @@ def health():
 def liveness():
     return jsonify({"ok": True}), 200
 
-# 포트폴리오 스냅샷
 @app.get("/portfolio")
 def portfolio():
     with POS_LOCK:
@@ -47,13 +46,11 @@ def portfolio():
     nowp = {t: get_price_safe(t) for t in snap.keys()}
     return jsonify({"ok": True, "positions": snap, "prices": nowp}), 200
 
-# 텔레그램 핑
 @app.get("/ping_telegram")
 def ping_telegram():
     send_telegram("✅ 텔레그램 핑 OK")
     return {"ok": True}, 200
 
-# 거래소 평균단가/수량으로 로컬 pos 동기화
 @app.get("/reconcile")
 def reconcile():
     try:
@@ -98,9 +95,9 @@ MIN_PCT_UP             = float(os.getenv("MIN_PCT_UP", "3.5"))
 MIN_PRICE_KRW          = float(os.getenv("MIN_PRICE_KRW", "100"))
 EXCLUDED_TICKERS       = set([t.strip() for t in os.getenv("EXCLUDED_TICKERS","KRW-BTC,KRW-ETH").split(",") if t.strip()])
 
-# IPR(Impulse→Pullback→Resumption) 진입 튜닝
-PB_MIN_PCT             = float(os.getenv("PB_MIN_PCT", "1.5"))  # 고점 대비 최소 되돌림 %
-PB_MAX_PCT             = float(os.getenv("PB_MAX_PCT", "4.0"))  # 고점 대비 최대 되돌림 %
+# IPR 진입 튜닝
+PB_MIN_PCT             = float(os.getenv("PB_MIN_PCT", "1.5"))
+PB_MAX_PCT             = float(os.getenv("PB_MAX_PCT", "4.0"))
 EMA_LEN                = int(os.getenv("EMA_LEN", "10"))
 RSI_MAX_BUY            = float(os.getenv("RSI_MAX_BUY", "70"))
 
@@ -119,9 +116,9 @@ REPORT_SENT_FILE       = os.getenv("REPORT_SENT_FILE", "./last_report_date.txt")
 DUST_KRW               = float(os.getenv("DUST_KRW", "5000"))
 
 # Protection & control
-MANAGER_TICK_MS        = int(os.getenv("MANAGER_TICK_MS", "400"))     # 기본 0.4초
-HARD_STOP_PCT          = float(os.getenv("HARD_STOP_PCT", "2.5"))     # 기본 -2.5%
-NO_TRADE_MIN_AROUND_9  = int(os.getenv("NO_TRADE_MIN_AROUND_9", "3")) # 09:00 ± n분 신규진입 스킵
+MANAGER_TICK_MS        = int(os.getenv("MANAGER_TICK_MS", "400"))
+HARD_STOP_PCT          = float(os.getenv("HARD_STOP_PCT", "2.5"))
+NO_TRADE_MIN_AROUND_9  = int(os.getenv("NO_TRADE_MIN_AROUND_9", "3"))
 
 # Persistence
 PERSIST_DIR            = os.getenv("PERSIST_DIR", "./")
@@ -603,7 +600,6 @@ def scan_once_and_maybe_buy():
                 inuse += p["qty"] * pr
     krw_left = max(0.0, target_used - inuse)
 
-    # 10분마다 스캔 요약
     if time.time() - _last_scan_summary_ts > 600:
         _last_scan_summary_ts = time.time()
         est_per_slot = (krw_left / free_slots) if free_slots > 0 else 0.0
@@ -688,7 +684,6 @@ def manage_positions_once():
         trail_line = highest*(1 - TRAIL_PCT/100.0) if trail_active else sl_price
         dyn_sl = max(sl_price, trail_line) if trail_active else sl_price
 
-        # 동적 SL 히트 (전량)
         if price <= dyn_sl and pnl_pct_now < TP_PCT:
             sr = safe_sell_market(UPBIT, t, 1.0)
             if sr.get("status") in ("OK", "DUST_CLEAN"):
@@ -713,7 +708,6 @@ def manage_positions_once():
                 tg_cooldown(t, end_reason, cd_min)
             continue
 
-        # 부분익절 50% (1회)
         if (not partial_done) and pnl_pct_now >= TP_PCT:
             sr = safe_sell_market(UPBIT, t, PARTIAL_TP_RATIO)
             if sr.get("status") == "OK":
@@ -735,7 +729,6 @@ def manage_positions_once():
                 save_pos()
                 continue
 
-        # 트레일 라인 터치
         if trail_active and price <= highest*(1 - TRAIL_PCT/100.0):
             sr = safe_sell_market(UPBIT, t, 1.0)
             if sr.get("status") in ("OK", "DUST_CLEAN"):
@@ -755,7 +748,6 @@ def manage_positions_once():
                 tg_cooldown(t, "트레일링", 30 if partial_done else 90)
                 continue
 
-        # 상태 갱신(메모리)
         with POS_LOCK:
             POS[t]["highest"] = highest
             POS[t]["trail_active"] = trail_active
@@ -881,7 +873,7 @@ def scanner_loop():
         try:
             scan_once_and_maybe_buy()
         except Exception:
-            print(f"[scanner] {traceback.format_exc()]}")
+            print(f"[scanner] {traceback.format_exc()}")
             on_rate_error()
         time.sleep(BACKOFF["scan_interval"])
 
@@ -898,7 +890,6 @@ def manager_loop():
 def init_bot():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
-    # Diag
     try:
         payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
         token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
