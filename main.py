@@ -3,9 +3,11 @@
 # - 24h 급등 스캐너: 거래대금 TOPN(기본 40) + 10분상승률/1분 스파이크 필터(완화 기본값)
 # - 비율 배분: 현금 버퍼 10% 유지, 동시 보유 2종목, 잔여현금/잔여슬롯 균등
 # - 매도: 손절 -1.2% → 부분익절 50% @ +2.5%(1회) → 트레일링(최고가 -1.5%)
+# - 비상 하드스톱: 손익률 ≤ -2.5% 즉시 전량 청산 (슬리피지 확산 방지)
 # - 단계형 쿨다운: 부분익절 경험 포지션 30분 / 그 외 90분
 # - 리포트: KST 09:00:15, 집계 구간 전일 09:00 ~ 당일 08:59:59.999
 # - 텔레그램 알림: 매수/부분익절/트레일/손절/쿨다운 상세 + 10분마다 스캔요약
+# - 시스템 보호: 09:00±(앞) N분 신규 진입 스킵
 # - Render/Gunicorn 호환: import-time autostart
 
 import os, time, json, csv, math, requests, pyupbit, threading, traceback, uuid, jwt, random
@@ -91,12 +93,20 @@ TRAIL_PCT              = float(os.getenv("TRAIL_PCT", "1.5"))         # 최고�
 PARTIAL_TP_RATIO       = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))  # 50%
 FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))       # 0.05%
 
-# Report
+# Reporter
 REPORT_TZ              = os.getenv("REPORT_TZ", "Asia/Seoul")
 REPORT_HOUR            = int(os.getenv("REPORT_HOUR", "9"))
 REPORT_MINUTE          = int(os.getenv("REPORT_MINUTE", "0"))
 REPORT_SENT_FILE       = os.getenv("REPORT_SENT_FILE", "./last_report_date.txt")
 DUST_KRW               = float(os.getenv("DUST_KRW", "5000"))
+
+# Protection & control (★ 신규 추가)
+# 매니저 루프 주기 (ms)
+MANAGER_TICK_MS        = int(os.getenv("MANAGER_TICK_MS", "400"))     # 기본 0.4초
+# 비상 하드스톱 임계치 (%): 손익률 ≤ -HARD_STOP_PCT 이면 즉시 전량 청산
+HARD_STOP_PCT          = float(os.getenv("HARD_STOP_PCT", "2.5"))     # 기본 -2.5%
+# 09:00 변동성 보호: 09:00부터 n분간 신규진입 스킵
+NO_TRADE_MIN_AROUND_9  = int(os.getenv("NO_TRADE_MIN_AROUND_9", "3")) # 기본 3분
 
 # Persistence
 PERSIST_DIR            = os.getenv("PERSIST_DIR", "./")
@@ -361,6 +371,14 @@ def fetch_top_by_turnover(krw_tickers, topn):
 def scan_once_and_maybe_buy():
     global _last_scan_summary_ts
 
+    # ★ 09:00 변동성 보호: 09시부터 NO_TRADE_MIN_AROUND_9 분 동안 신규진입 스킵
+    kst = now_kst()
+    if kst.hour == 9 and kst.minute < NO_TRADE_MIN_AROUND_9:
+        if time.time() - _last_scan_summary_ts > 600:
+            _last_scan_summary_ts = time.time()
+            send_telegram("⏸ 09:00 변동성 보호로 신규 진입 스킵")
+        return
+
     # 현재 보유/빈 슬롯
     with POS_LOCK:
         open_cnt = sum(1 for t,p in POS.items() if p.get("qty",0.0) > 0.0)
@@ -480,11 +498,28 @@ def manage_positions_once():
         price = get_price_safe(t)
         if not price or avg<=0: continue
 
+        # ===== ★ 비상 하드스톱: 손익률 ≤ -HARD_STOP_PCT 즉시 청산 =====
+        pnl_pct_now = (price-avg)/avg*100.0
+        if pnl_pct_now <= -HARD_STOP_PCT:
+            avg_sell, filled, got = sell_market_all(t)
+            if filled and filled>0:
+                pnl_pct = ((avg_sell-avg)/avg)*100.0 if avg_sell else pnl_pct_now
+                tg_stop(t, avg_sell, filled, pnl_pct)
+                append_csv({"ts": now_str(),"ticker": t,"side":"EMERGENCY_STOP","qty": filled,"price": avg_sell,
+                            "krw": got,"fee": got*FEE_RATE,"pnl_krw": got - filled*avg,"pnl_pct": pnl_pct,"note": f"hard_stop{-HARD_STOP_PCT:.1f}%"})
+                with POS_LOCK:
+                    POS[t]["qty"] = 0.0
+                    POS[t]["cooldown_until"] = time.time() + 5400  # 90분
+                    COOLDOWN[t] = POS[t]["cooldown_until"]
+                save_pos()
+            continue
+        # ============================================================
+
         highest = max(p.get("highest",avg), price)
         trail_active = p.get("trail_active", False)
         partial_done = p.get("partial_tp_done", False)
 
-        # 트레일 활성화(+1.0%)
+        # 트레일 활성화(+TRAIL_ACTIVATE_PCT %)
         if (not trail_active) and ((price-avg)/avg*100.0 >= TRAIL_ACTIVATE_PCT):
             trail_active = True
             send_telegram(f"🛡️ 트레일 활성화: {t} peak={highest:.4f} | line {TRAIL_PCT:.2f}%")
@@ -492,8 +527,6 @@ def manage_positions_once():
         sl_price = avg*(1 - SL_PCT/100.0)
         trail_line = highest*(1 - TRAIL_PCT/100.0) if trail_active else sl_price
         dyn_sl = max(sl_price, trail_line) if trail_active else sl_price
-
-        pnl_pct_now = (price-avg)/avg*100.0
 
         # 1) 하드 스톱/트레일 라인(전량 청산)
         if price <= dyn_sl and pnl_pct_now < TP_PCT:
@@ -685,7 +718,7 @@ def reporter_loop():
                 continue
             time.sleep(30)
         except Exception:
-            print(f"[reporter] {traceback.format_exc()}")
+            print(f"[reporter] {traceback.format_exc()]}")
             time.sleep(5)
 
 # ================= Loops =================
@@ -706,7 +739,8 @@ def manager_loop():
             manage_positions_once()
         except Exception:
             print(f"[manager] {traceback.format_exc()}")
-        time.sleep(1.2)
+        # ★ 매니저 주기: 기본 0.4초 (ENV로 조절)
+        time.sleep(max(0.1, MANAGER_TICK_MS/1000.0))
 
 # ================= Boot =================
 def init_bot():
@@ -724,6 +758,13 @@ def init_bot():
         print(f"[diag] {e}")
     load_pos()
     send_telegram("🤖 봇 시작됨")
+    # 시작 시 현재 임계치 브리핑(가시성)
+    send_telegram(
+        f"⚙️ thresholds | 10m≥+{MIN_PCT_UP:.1f}% & 1m×≥{VOL_SPIKE_MULT:.2f} | "
+        f"SL={SL_PCT:.2f}% | TP(partial@{TP_PCT:.1f}%, {int(PARTIAL_TP_RATIO*100)}%) | "
+        f"TRAIL act {TRAIL_ACTIVATE_PCT:.1f}% / line {TRAIL_PCT:.1f}% | "
+        f"hard_stop {HARD_STOP_PCT:.1f}% | manager {MANAGER_TICK_MS}ms | TOPN={BACKOFF['topn']}"
+    )
 
 def start_threads():
     threading.Thread(target=scanner_loop, daemon=True).start()
