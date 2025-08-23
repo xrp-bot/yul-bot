@@ -1,19 +1,18 @@
 # main.py — Upbit Multi-Asset Gainer Scanner Bot (24h)
-# Spec: Proportional allocation (cash buffer 10%), MAX 2 positions,
-# Partial TP 50% @ +2.5% once, Trailing stop (peak -1.5%) after +1.0%,
-# Staged cooldown (30m on success, 90m on fail), 24h scan (TOP25),
-# 09:00:15 KST report (prev 09:00 ~ today 08:59:59.999), dust >= ₩5,000.
-#
-# Notes:
-# - Replaces old single-SYMBOL entry logic with market-wide scanner.
-# - pos.json schema: dict[ticker] = {qty, avg, entry_ts, highest, trail_active, partial_tp_done, cooldown_until}
-# - CSV columns updated to include ticker.
+# Spec (2025-08):
+# - 24h 급등 스캐너: 거래대금 TOPN(기본 40) + 10분상승률/1분 스파이크 필터(완화 기본값)
+# - 비율 배분: 현금 버퍼 10% 유지, 동시 보유 2종목, 잔여현금/잔여슬롯 균등
+# - 매도: 손절 -1.2% → 부분익절 50% @ +2.5%(1회) → 트레일링(최고가 -1.5%)
+# - 단계형 쿨다운: 부분익절 경험 포지션 30분 / 그 외 90분
+# - 리포트: KST 09:00:15, 집계 구간 전일 09:00 ~ 당일 08:59:59.999
+# - 텔레그램 알림: 매수/부분익절/트레일/손절/쿨다운 상세 + 10분마다 스캔요약
+# - Render/Gunicorn 호환: import-time autostart
 
 import os, time, json, csv, math, requests, pyupbit, threading, traceback, uuid, jwt, random
 from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify, request, has_request_context
+from flask import Flask, jsonify, request
 
-# =============== Flask (minimal compatibility) ===============
+# ================= Flask =================
 app = Flask(__name__)
 
 @app.get("/")
@@ -35,7 +34,36 @@ def portfolio():
     nowp = {t: get_price_safe(t) for t in snap.keys()}
     return jsonify({"ok": True, "positions": snap, "prices": nowp}), 200
 
-# =============== ENV ===============
+# ===== (Optional) 빠른 점검 라우트 =====
+@app.get("/ping_telegram")
+def ping_telegram():
+    send_telegram("✅ 텔레그램 핑 OK")
+    return {"ok": True}, 200
+
+@app.get("/reconcile")
+def reconcile():
+    try:
+        avg_map = get_exchange_avg_map()
+        changed = 0
+        with POS_LOCK:
+            for t, p in list(POS.items()):
+                qty_ex = get_balance_coin(t)
+                if qty_ex <= 0:
+                    if POS[t].get("qty", 0.0) != 0.0:
+                        POS[t]["qty"] = 0.0
+                        changed += 1
+                else:
+                    if abs(POS[t].get("qty", 0.0) - qty_ex) > 1e-9:
+                        changed += 1
+                    POS[t]["qty"] = qty_ex
+                    POS[t]["avg"] = avg_map.get(t, p.get("avg", 0.0)) or p.get("avg", 0.0)
+        save_pos()
+        send_telegram(f"♻️ 재동기화 완료 — 변경 {changed}건")
+        return {"ok": True, "changed": changed}, 200
+    except Exception as e:
+        return {"ok": False, "err": str(e)}, 500
+
+# ================= ENV =================
 ACCESS_KEY       = os.getenv("ACCESS_KEY")
 SECRET_KEY       = os.getenv("SECRET_KEY")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
@@ -46,22 +74,22 @@ CASH_BUFFER_PCT        = float(os.getenv("CASH_BUFFER_PCT", "0.10"))  # 10%
 MAX_OPEN_POSITIONS     = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5500"))
 
-# Scanner
-SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
-TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "25"))
-VOL_SPIKE_MULT         = float(os.getenv("VOL_SPIKE_MULT", "2.8"))
-LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))
-MIN_PCT_UP             = float(os.getenv("MIN_PCT_UP", "5.5"))
+# Scanner (완화 기본값)
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))    # 45초
+TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "40"))         # TOP 40
+VOL_SPIKE_MULT         = float(os.getenv("VOL_SPIKE_MULT", "1.8"))    # ×1.8
+LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))         # 10분
+MIN_PCT_UP             = float(os.getenv("MIN_PCT_UP", "3.5"))        # +3.5%
 MIN_PRICE_KRW          = float(os.getenv("MIN_PRICE_KRW", "100"))
 EXCLUDED_TICKERS       = set([t.strip() for t in os.getenv("EXCLUDED_TICKERS","KRW-BTC,KRW-ETH").split(",") if t.strip()])
 
 # Trailing / TP / SL
-SL_PCT                 = float(os.getenv("SL_PCT", "1.2"))   # -1.2%
-TP_PCT                 = float(os.getenv("TP_PCT", "2.5"))   # +2.5% (partial 50%)
-TRAIL_ACTIVATE_PCT     = float(os.getenv("TRAIL_ACTIVATE_PCT", "1.0"))  # +1.0% then arm
-TRAIL_PCT              = float(os.getenv("TRAIL_PCT", "1.5"))  # peak -1.5%
-PARTIAL_TP_RATIO       = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))    # 50%
-FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))         # 0.05%
+SL_PCT                 = float(os.getenv("SL_PCT", "1.2"))            # -1.2%
+TP_PCT                 = float(os.getenv("TP_PCT", "2.5"))            # +2.5% (partial 50%)
+TRAIL_ACTIVATE_PCT     = float(os.getenv("TRAIL_ACTIVATE_PCT", "1.0"))# +1.0% 후 활성
+TRAIL_PCT              = float(os.getenv("TRAIL_PCT", "1.5"))         # 최고가 -1.5%
+PARTIAL_TP_RATIO       = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))  # 50%
+FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))       # 0.05%
 
 # Report
 REPORT_TZ              = os.getenv("REPORT_TZ", "Asia/Seoul")
@@ -81,13 +109,13 @@ REQ_CHUNK              = 90
 SLEEP_TICKER           = 0.10
 SLEEP_OHLCV            = 0.10
 
-# =============== Globals ===============
+# ================= Globals =================
 KST = timezone(timedelta(hours=9))
 UPBIT = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY) if (ACCESS_KEY and SECRET_KEY) else None
 
 POS_LOCK = threading.Lock()
 POS: dict[str, dict] = {}          # ticker -> position state
-COOLDOWN: dict[str, float] = {}    # ticker -> epoch (redundant, also stored in POS on exit)
+COOLDOWN: dict[str, float] = {}    # ticker -> epoch
 
 BACKOFF = {
     "topn": TOPN_INITIAL,
@@ -96,7 +124,7 @@ BACKOFF = {
     "sleep_ohlcv": SLEEP_OHLCV,
 }
 
-# =============== Telegram ===============
+# ================= Telegram =================
 def _post_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print(text); return
@@ -108,7 +136,55 @@ def _post_telegram(text: str):
 
 def send_telegram(msg: str): _post_telegram(msg)
 
-# =============== Util / IO ===============
+# 상세 포맷 헬퍼
+def tg_buy(ticker: str, qty: float, avg: float, krw_spent: float):
+    send_telegram(
+        "🚀 매수 체결\n"
+        f"— 심볼: {ticker}\n"
+        f"— 수량: {qty:.6f}\n"
+        f"— 체결가: ₩{avg:,.4f}\n"
+        f"— 투자금액: ₩{krw_spent:,.0f}"
+    )
+
+def tg_partial(ticker: str, qty_sold: float, avg_sell: float, realized_krw: float, pnl_pct: float, left_qty: float):
+    send_telegram(
+        "✅ 부분 익절 매도 (50%)\n"
+        f"— 심볼: {ticker}\n"
+        f"— 수량: {qty_sold:.6f}\n"
+        f"— 매도가: ₩{avg_sell:,.4f}\n"
+        f"— 실현수익: ₩{realized_krw:,.0f} ({pnl_pct:.2f}%)\n"
+        f"— 잔여 보유: {left_qty:.6f}"
+    )
+
+def tg_trailing(ticker: str, avg_sell: float, filled: float, pnl_pct: float):
+    send_telegram(
+        "📉 트레일링 매도\n"
+        f"— 심볼: {ticker}\n"
+        f"— 수량: {filled:.6f}\n"
+        f"— 매도가: ₩{avg_sell:,.4f}\n"
+        f"— 실현손익률: {pnl_pct:.2f}%\n"
+        f"— 상태: 포지션 종료"
+    )
+
+def tg_stop(ticker: str, avg_sell: float, filled: float, pnl_pct: float):
+    send_telegram(
+        "⚠️ 손절 매도\n"
+        f"— 심볼: {ticker}\n"
+        f"— 수량: {filled:.6f}\n"
+        f"— 매도가: ₩{avg_sell:,.4f}\n"
+        f"— 손익률: {pnl_pct:.2f}%\n"
+        f"— 상태: 포지션 종료"
+    )
+
+def tg_cooldown(ticker: str, reason: str, minutes: int):
+    send_telegram(
+        "⏳ 쿨다운 적용\n"
+        f"— 심볼: {ticker}\n"
+        f"— 종료 사유: {reason}\n"
+        f"— 쿨다운: {minutes}분"
+    )
+
+# ================= Util / IO =================
 def now_kst() -> datetime: return datetime.now(tz=KST)
 def now_str() -> str: return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -178,7 +254,7 @@ def append_csv(row: dict):
         if not exists: w.writeheader()
         w.writerow(row)
 
-# =============== Exchange helpers ===============
+# ================= Exchange helpers =================
 def get_balance_krw():
     try: return float(UPBIT.get_balance("KRW") or 0.0)
     except Exception: return 0.0
@@ -250,7 +326,7 @@ def sell_market_ratio(ticker, ratio):
 def sell_market_all(ticker):
     return sell_market_ratio(ticker, 1.0)
 
-# =============== Rate/backoff ===============
+# ================= Rate/backoff =================
 def on_rate_error():
     BACKOFF["topn"] = max(15, BACKOFF["topn"]-5)
     BACKOFF["scan_interval"] = min(90, BACKOFF["scan_interval"]+15)
@@ -258,8 +334,9 @@ def on_rate_error():
     BACKOFF["sleep_ohlcv"] *= 1.5
     send_telegram(f"🧯 백오프 적용: TOPN={BACKOFF['topn']}, scan={BACKOFF['scan_interval']}s")
 
-# =============== Scanner ===============
+# ================= Scanner =================
 TICKER_URL = "https://api.upbit.com/v1/ticker"
+_last_scan_summary_ts = 0.0  # 10분 간격 스캔 요약
 
 def fetch_top_by_turnover(krw_tickers, topn):
     res = []
@@ -282,20 +359,26 @@ def fetch_top_by_turnover(krw_tickers, topn):
         return []
 
 def scan_once_and_maybe_buy():
-    # SKIP if slots full
+    global _last_scan_summary_ts
+
+    # 현재 보유/빈 슬롯
     with POS_LOCK:
         open_cnt = sum(1 for t,p in POS.items() if p.get("qty",0.0) > 0.0)
     free_slots = max(0, MAX_OPEN_POSITIONS - open_cnt)
-    if free_slots <= 0: return
+    if free_slots <= 0:
+        # 10분마다 요약
+        if time.time() - _last_scan_summary_ts > 600:
+            _last_scan_summary_ts = time.time()
+            send_telegram(f"🔎 스캔요약: 후보 0 / free_slots=0 (슬롯 가득)")
+        return
 
-    # Ticker universe
+    # 유니버스/쿨다운/보유 제외
     try:
         krw_tickers = [t for t in pyupbit.get_tickers("KRW") if t not in EXCLUDED_TICKERS]
     except Exception as e:
         send_telegram(f"⚠️ 티커 조회 실패: {e}")
         return
 
-    # Cooldown filter
     now = time.time()
     filtered = []
     for t in krw_tickers:
@@ -306,7 +389,11 @@ def scan_once_and_maybe_buy():
 
     # TOPN by turnover
     topN = fetch_top_by_turnover(filtered, BACKOFF["topn"])
-    if not topN: return
+    if not topN:
+        if time.time() - _last_scan_summary_ts > 600:
+            _last_scan_summary_ts = time.time()
+            send_telegram(f"🔎 스캔요약: 후보 0 / TOPN={BACKOFF['topn']}")
+        return
 
     # Score candidates
     cands = []
@@ -322,7 +409,6 @@ def scan_once_and_maybe_buy():
             ref = closes[-(LOOKBACK_MIN+1)]
             last = closes[-1]
             pct_up = (last - ref) / ref * 100.0
-            # value spike
             vals = [c*v for c,v in zip(closes,vols)]
             past_avg = sum(vals[-(LOOKBACK_MIN+1):-1]) / LOOKBACK_MIN
             recent = vals[-1]
@@ -334,13 +420,9 @@ def scan_once_and_maybe_buy():
         except Exception as e:
             print(f"[scan:{t}] {e}")
 
-    if not cands: return
-    cands.sort(key=lambda x: (x[1], x[3]), reverse=True)
-
-    # Budgeting (cash buffer 10%, proportional per free slot)
+    # 자금 계산
     krw_total = get_balance_krw()
     target_used = krw_total * (1.0 - CASH_BUFFER_PCT)
-    # Estimate in-use value (held positions at current price)
     inuse = 0.0
     with POS_LOCK:
         for t, p in POS.items():
@@ -348,10 +430,25 @@ def scan_once_and_maybe_buy():
                 pr = get_price_safe(t) or p["avg"]
                 inuse += p["qty"]*pr
     krw_left = max(0.0, target_used - inuse)
-    if krw_left < MIN_ORDER_KRW: return
-    per_slot = krw_left / free_slots
-    if per_slot < MIN_ORDER_KRW: return
 
+    # 10분마다 스캔 요약
+    if time.time() - _last_scan_summary_ts > 600:
+        _last_scan_summary_ts = time.time()
+        est_per_slot = (krw_left / free_slots) if free_slots>0 else 0.0
+        send_telegram(f"🔎 스캔요약: 후보 {len(cands)} / TOPN={BACKOFF['topn']} / free_slots={free_slots} / per_slot≈₩{est_per_slot:,.0f}")
+
+    if not cands: return
+
+    if krw_left < MIN_ORDER_KRW:
+        send_telegram(f"⏸ 매수 스킵: 남은 매수가능액 ₩{krw_left:,.0f} < 최소주문 ₩{MIN_ORDER_KRW:,.0f}")
+        return
+    per_slot = krw_left / free_slots
+    if per_slot < MIN_ORDER_KRW:
+        send_telegram(f"⏸ 매수 스킵: per_slot ₩{per_slot:,.0f} < 최소주문 ₩{MIN_ORDER_KRW:,.0f}")
+        return
+
+    # 진입
+    cands.sort(key=lambda x: (x[1], x[3]), reverse=True)
     picks = cands[:free_slots]
     for (t,score,last,turn) in picks:
         avg, qty = buy_market_krw(t, per_slot)
@@ -367,13 +464,12 @@ def scan_once_and_maybe_buy():
                     "cooldown_until": 0.0,
                 }
             save_pos()
-            send_telegram(f"🚀 급등 진입: {t} | 배정 ₩{per_slot:,.0f} | 10분+≥{MIN_PCT_UP:.1f}% & 스파이크×≥{VOL_SPIKE_MULT:.1f}")
+            tg_buy(t, qty, avg, per_slot)
             append_csv({"ts": now_str(),"ticker": t,"side":"BUY","qty": qty,"price": avg,
                         "krw": -(per_slot),"fee": per_slot*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"scanner_entry"})
 
-# =============== Manager (TP/SL/Trailing/Partial) ===============
+# ================= Manager (TP/SL/Trailing/Partial) =================
 def manage_positions_once():
-    now = time.time()
     with POS_LOCK:
         items = list(POS.items())
 
@@ -384,81 +480,86 @@ def manage_positions_once():
         price = get_price_safe(t)
         if not price or avg<=0: continue
 
-        # Update highest
         highest = max(p.get("highest",avg), price)
         trail_active = p.get("trail_active", False)
         partial_done = p.get("partial_tp_done", False)
 
-        # Arm trailing after +1.0%
+        # 트레일 활성화(+1.0%)
         if (not trail_active) and ((price-avg)/avg*100.0 >= TRAIL_ACTIVATE_PCT):
             trail_active = True
             send_telegram(f"🛡️ 트레일 활성화: {t} peak={highest:.4f} | line {TRAIL_PCT:.2f}%")
 
-        # Compute thresholds
         sl_price = avg*(1 - SL_PCT/100.0)
         trail_line = highest*(1 - TRAIL_PCT/100.0) if trail_active else sl_price
         dyn_sl = max(sl_price, trail_line) if trail_active else sl_price
 
         pnl_pct_now = (price-avg)/avg*100.0
 
-        # 1) Hard stop
+        # 1) 하드 스톱/트레일 라인(전량 청산)
         if price <= dyn_sl and pnl_pct_now < TP_PCT:
-            # Exit ALL -> cooldown 90m if no partial ever happened
             avg_sell, filled, got = sell_market_all(t)
             if filled and filled>0:
                 pnl_pct = ((avg_sell-avg)/avg)*100.0 if avg_sell else 0.0
-                send_telegram(f"💥 손절/트레일링 청산: {t} @ {avg_sell:.4f} ({pnl_pct:.2f}%)")
+                if pnl_pct < 0:
+                    tg_stop(t, avg_sell, filled, pnl_pct)
+                    end_reason = "손절"
+                    cd_min = 90 if not p.get("partial_tp_done") else 30
+                else:
+                    tg_trailing(t, avg_sell, filled, pnl_pct)
+                    end_reason = "트레일링"
+                    cd_min = 30 if p.get("partial_tp_done") else 90
+
                 append_csv({"ts": now_str(),"ticker": t,"side":"STOP/TRAIL","qty": filled,"price": avg_sell,
                             "krw": got,"fee": got*FEE_RATE,"pnl_krw": got - filled*avg,"pnl_pct": pnl_pct,"note": "dyn_sl"})
-                # Remove pos + set cooldown
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
-                    POS[t]["cooldown_until"] = time.time() + (1800 if POS[t].get("partial_tp_done") else 5400)  # 30m if success, else 90m
+                    POS[t]["cooldown_until"] = time.time() + (cd_min * 60)
                     COOLDOWN[t] = POS[t]["cooldown_until"]
                 save_pos()
+                tg_cooldown(t, end_reason if p.get("partial_tp_done") else f"{end_reason}/부분익절 미발생", cd_min)
             continue
 
-        # 2) Partial TP 50% once at +2.5% (before trailing exit)
+        # 2) 부분익절 50% (1회)
         if (not partial_done) and (pnl_pct_now >= TP_PCT):
             avg_sell, filled, got = sell_market_ratio(t, PARTIAL_TP_RATIO)
             if filled and filled>0:
                 pnl_pct = ((avg_sell-avg)/avg)*100.0 if avg_sell else TP_PCT
-                send_telegram(f"📌 부분익절 50%: {t} @ {avg_sell:.4f} ({pnl_pct:.2f}%)")
+                left_after = max(0.0, (p.get("qty",0.0) or 0.0) - (filled or 0.0))
+                tg_partial(t, filled, avg_sell, got - filled*avg, pnl_pct, left_after)
+
                 append_csv({"ts": now_str(),"ticker": t,"side":"PARTIAL_TP","qty": filled,"price": avg_sell,
                             "krw": got,"fee": got*FEE_RATE,"pnl_krw": got - filled*avg,"pnl_pct": pnl_pct,"note":"partial@2.5%"})
-                # reduce qty, mark partial, keep trailing ON
                 with POS_LOCK:
                     left = max(0.0, POS[t]["qty"] - filled)
                     POS[t]["qty"] = left
                     POS[t]["partial_tp_done"] = True
                     POS[t]["highest"] = max(POS[t]["highest"], price)
-                    POS[t]["trail_active"] = True  # ensure on
+                    POS[t]["trail_active"] = True
                 save_pos()
-                # If dust remains, close later by trailing
                 continue
 
-        # 3) Trailing take for remainder (only if armed and price falls to line)
+        # 3) 트레일 라인 터치로 잔량 전량 청산
         if trail_active and price <= (highest*(1 - TRAIL_PCT/100.0)):
             avg_sell, filled, got = sell_market_all(t)
             if filled and filled>0:
                 pnl_pct = ((avg_sell-avg)/avg)*100.0 if avg_sell else 0.0
-                send_telegram(f"🔚 트레일링 청산: {t} @ {avg_sell:.4f} ({pnl_pct:.2f}%)")
+                tg_trailing(t, avg_sell, filled, pnl_pct)
                 append_csv({"ts": now_str(),"ticker": t,"side":"TRAIL","qty": filled,"price": avg_sell,
                             "krw": got,"fee": got*FEE_RATE,"pnl_krw": got - filled*avg,"pnl_pct": pnl_pct,"note":"trail_hit"})
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
-                    POS[t]["cooldown_until"] = time.time() + (1800 if POS[t].get("partial_tp_done") else 5400)
+                    POS[t]["cooldown_until"] = time.time() + (1800 if p.get("partial_tp_done") else 5400)
                     COOLDOWN[t] = POS[t]["cooldown_until"]
                 save_pos()
+                tg_cooldown(t, "트레일링", 30 if p.get("partial_tp_done") else 90)
                 continue
 
-        # Persist updated highs/flags
+        # 상태 저장(고빈도 저장 방지: 메모리만 갱신)
         with POS_LOCK:
             POS[t]["highest"] = highest
             POS[t]["trail_active"] = trail_active
-        # (no save_pos every tick for I/O; manager loop is frequent)
 
-# =============== Reporter (09:00:15 KST) ===============
+# ================= Reporter (09:00:15 KST) =================
 def tz_now():
     try:
         import zoneinfo
@@ -467,7 +568,6 @@ def tz_now():
         return datetime.now()
 
 def get_exchange_avg_map():
-    # { 'KRW-XYZ': avg_buy_price or None }
     out = {}
     try:
         bals = UPBIT.get_balances()
@@ -514,7 +614,6 @@ def summarize_between(start_dt_kst, end_dt_kst):
 
 def build_daily_report():
     now = tz_now()
-    # Window: prev 09:00 ~ today 08:59:59.999
     today_9 = now.replace(hour=9, minute=0, second=0, microsecond=0)
     if now >= today_9:
         start = today_9 - timedelta(days=1)
@@ -524,7 +623,6 @@ def build_daily_report():
         end   = today_9 - timedelta(days=1, microseconds=1)
     met = summarize_between(start, end)
 
-    # Snapshot balances
     with POS_LOCK:
         holdings = list(POS.items())
     avg_map = get_exchange_avg_map()
@@ -590,9 +688,9 @@ def reporter_loop():
             print(f"[reporter] {traceback.format_exc()}")
             time.sleep(5)
 
-# =============== Loops ===============
+# ================= Loops =================
 def scanner_loop():
-    send_telegram("🔎 스캐너 시작 (24h, TOPN=25)")
+    send_telegram(f"🔎 스캐너 시작 (24h, TOPN={BACKOFF['topn']})")
     while True:
         try:
             scan_once_and_maybe_buy()
@@ -610,11 +708,11 @@ def manager_loop():
             print(f"[manager] {traceback.format_exc()}")
         time.sleep(1.2)
 
-# =============== Boot ===============
+# ================= Boot =================
 def init_bot():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
-    # Warm up
+    # Diag
     try:
         payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
         token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
@@ -627,23 +725,21 @@ def init_bot():
     load_pos()
     send_telegram("🤖 봇 시작됨")
 
-# Threads
 def start_threads():
     threading.Thread(target=scanner_loop, daemon=True).start()
     threading.Thread(target=manager_loop, daemon=True).start()
     threading.Thread(target=reporter_loop, daemon=True).start()
 
-# =============== __main__ ===============
-if __name__ == "__main__":
-    init_bot()
-    start_threads()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
-
-    # === import-time autostart for gunicorn/wsgi ===
+# === import-time autostart for gunicorn/wsgi ===
 if not getattr(app, "_bot_started", False):
     init_bot()
     start_threads()
     app._bot_started = True
 
-
-    
+# ================= __main__ =================
+if __name__ == "__main__":
+    # (gunicorn에서도 이미 autostart 되었지만, 단독 실행시도 대응)
+    if not getattr(app, "_bot_started", False):
+        init_bot(); start_threads(); app._bot_started = True
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
