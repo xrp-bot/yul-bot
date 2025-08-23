@@ -1,28 +1,22 @@
-# main.py — Upbit Multi-Asset Gainer Scanner Bot (24h) — IPR + SafeOrders (fixed)
-# Spec (2025-08):
-# - 24h 급등 스캐너: 거래대금 TOPN + 10분상승률/1분 스파이크 필터
-# - IPR 진입: 고점 대비 1.5~4.0% 풀백 + EMA 상회 + 직전 고점 미세 돌파 + RSI≤70
-# - 자금 배분: 현금 버퍼 10%, 동시 보유 2종목, per-slot 균등
-# - 매도: 손절 -1.2% → 부분익절 50% @ +2.5%(1회) → 트레일링(최고가 -1.5%)
-# - 비상 하드스톱: ≤ -2.5% 즉시 전량 청산
-# - 단계형 쿨다운: 부분익절 경험 30분 / 그 외 90분
-# - 리포트: 09:00:15 KST
-# - Render/Gunicorn 호환: import-time autostart
+"""
+main.py — Upbit Multi-Asset Gainer Scanner Bot (24h)
+Strategy: Bottom-Reversal Entry + SafeOrders + Manager + Daily Reporter
+Spec (2025-08):
+- Scanner: 거래대금 TOPN → 바닥 반등 조건(RSI≤35, EMA10/20 지지, 저점대비 +1% 반등, 거래량↑) 충족 시 매수
+- Capital: 현금 버퍼 10%, 동시 보유 2종목, 잔여현금/잔여슬롯 균등 배분
+- Sell: 손절 -1.2% → 부분익절 50% @ +2.5%(1회) → 트레일링(최고가 -1.5%)
+- Emergency Hard Stop: ≤ -2.5% 즉시 전량 청산
+- Cooldown: 부분익절 경험 30분 / 그 외 90분
+- Reporter: 매일 09:00:15 KST 텔레그램 리포트
+- Safety: Safe BUY/SELL(재시도·락·dust정리·최소주문 체크), 09:00 변동성 보호, 레이트리밋 백오프
+- Render/Gunicorn 호환: import-time autostart
+"""
 
-import os
-import time
-import json
-import csv
-import math
-import random
-import requests
-import pyupbit
-import threading
-import traceback
-import uuid
-import jwt
+# ================= Imports =================
+import os, time, json, csv, math, random, requests, pyupbit, threading, traceback, uuid, jwt
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
+from collections import defaultdict
 
 # ================= Flask =================
 app = Flask(__name__)
@@ -58,7 +52,7 @@ def reconcile():
         changed = 0
         with POS_LOCK:
             for t, p in list(POS.items()):
-                qty_ex = get_balance_coin(t)
+                qty_ex = get_balance_coin(t)  # KRW-XXX 가능
                 if qty_ex <= 0:
                     if POS[t].get("qty", 0.0) != 0.0:
                         POS[t]["qty"] = 0.0
@@ -87,26 +81,25 @@ MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5500"))
 FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))       # 0.05%
 
 # Scanner 기본
-SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))
-TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "40"))
-VOL_SPIKE_MULT         = float(os.getenv("VOL_SPIKE_MULT", "1.8"))
-LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))
-MIN_PCT_UP             = float(os.getenv("MIN_PCT_UP", "3.5"))
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))    # 45초
+TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "40"))         # TOP 40
+VOL_SPIKE_MULT         = float(os.getenv("VOL_SPIKE_MULT", "1.5"))    # 바닥전략: 1.5배로 완화
+LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))         # 10분
 MIN_PRICE_KRW          = float(os.getenv("MIN_PRICE_KRW", "100"))
 EXCLUDED_TICKERS       = set([t.strip() for t in os.getenv("EXCLUDED_TICKERS","KRW-BTC,KRW-ETH").split(",") if t.strip()])
 
-# IPR 진입 튜닝
-PB_MIN_PCT             = float(os.getenv("PB_MIN_PCT", "1.5"))
-PB_MAX_PCT             = float(os.getenv("PB_MAX_PCT", "4.0"))
-EMA_LEN                = int(os.getenv("EMA_LEN", "10"))
-RSI_MAX_BUY            = float(os.getenv("RSI_MAX_BUY", "70"))
+# Bottom Entry 튜닝
+RSI_MAX_BOTTOM         = float(os.getenv("RSI_MAX_BOTTOM", "35"))     # RSI ≤ 35
+EMA_NEAR_PCT           = float(os.getenv("EMA_NEAR_PCT", "1.0"))      # EMA10/20 대비 -1% 이내(지지)
+REBOUND_FROM_LOW_PCT   = float(os.getenv("REBOUND_FROM_LOW_PCT", "1.0")) # 최근 저점 대비 +1% 반등
+VOL_BOOST_MULT         = float(os.getenv("VOL_BOOST_MULT", "1.5"))    # 최근 10봉 평균 대비 ≥1.5배
 
 # TP/SL/Trailing
-SL_PCT                 = float(os.getenv("SL_PCT", "1.2"))
-TP_PCT                 = float(os.getenv("TP_PCT", "2.5"))
-TRAIL_ACTIVATE_PCT     = float(os.getenv("TRAIL_ACTIVATE_PCT", "1.0"))
-TRAIL_PCT              = float(os.getenv("TRAIL_PCT", "1.5"))
-PARTIAL_TP_RATIO       = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))
+SL_PCT                 = float(os.getenv("SL_PCT", "1.2"))            # -1.2%
+TP_PCT                 = float(os.getenv("TP_PCT", "2.5"))            # +2.5%
+TRAIL_ACTIVATE_PCT     = float(os.getenv("TRAIL_ACTIVATE_PCT", "1.0"))# +1.0% 후 활성
+TRAIL_PCT              = float(os.getenv("TRAIL_PCT", "1.5"))         # 최고가 -1.5%
+PARTIAL_TP_RATIO       = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))  # 50%
 
 # Reporter
 REPORT_TZ              = os.getenv("REPORT_TZ", "Asia/Seoul")
@@ -136,8 +129,8 @@ KST = timezone(timedelta(hours=9))
 UPBIT = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY) if (ACCESS_KEY and SECRET_KEY) else None
 
 POS_LOCK = threading.Lock()
-POS: dict[str, dict] = {}
-COOLDOWN: dict[str, float] = {}
+POS: dict[str, dict] = {}          # ticker -> position state
+COOLDOWN: dict[str, float] = {}    # ticker -> epoch
 
 BACKOFF = {
     "topn": TOPN_INITIAL,
@@ -149,16 +142,14 @@ BACKOFF = {
 # ================= Telegram =================
 def _post_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text)
-        return
+        print(text); return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=5)
     except Exception as e:
         print(f"[TG_FAIL] {e} | {text}")
 
-def send_telegram(msg: str):
-    _post_telegram(msg)
+def send_telegram(msg: str): _post_telegram(msg)
 
 def tg_buy(ticker: str, qty: float, avg: float, krw_spent: float):
     send_telegram(
@@ -208,18 +199,14 @@ def tg_cooldown(ticker: str, reason: str, minutes: int):
     )
 
 # ================= Util / IO =================
-def now_kst() -> datetime:
-    return datetime.now(tz=KST)
-
-def now_str() -> str:
-    return now_kst().strftime("%Y-%m-%d %H:%M:%S")
+def now_kst() -> datetime: return datetime.now(tz=KST)
+def now_str() -> str: return now_kst().strftime("%Y-%m-%d %H:%M:%S")
 
 def get_price_safe(ticker, tries=3, delay=0.6):
     for i in range(tries):
         try:
             p = pyupbit.get_current_price(ticker)
-            if p is not None:
-                return float(p)
+            if p is not None: return float(p)
         except Exception as e:
             print(f"[price:{ticker}] {e}")
         time.sleep(delay*(i+1))
@@ -229,34 +216,38 @@ def get_ohlcv_safe(ticker, count=30, interval="minute1", tries=3, delay=0.6):
     for i in range(tries):
         try:
             df = pyupbit.get_ohlcv(ticker, interval=interval, count=count)
-            if df is not None and not df.empty:
-                return df
+            if df is not None and not df.empty: return df
         except Exception as e:
             print(f"[ohlcv:{ticker}] {e}")
         time.sleep(delay*(i+1))
     return None
 
+def append_csv(row: dict):
+    header = ["ts","ticker","side","qty","price","krw","fee","pnl_krw","pnl_pct","note"]
+    exists = os.path.exists(CSV_FILE)
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not exists: w.writeheader()
+        w.writerow(row)
+
 def save_pos():
     with POS_LOCK:
-        obj = {
-            t: {
-                "qty": float(p.get("qty",0.0)),
-                "avg": float(p.get("avg",0.0)),
-                "entry_ts": p.get("entry_ts"),
-                "highest": float(p.get("highest",0.0)),
-                "trail_active": bool(p.get("trail_active", False)),
-                "partial_tp_done": bool(p.get("partial_tp_done", False)),
-                "cooldown_until": float(p.get("cooldown_until", 0.0)),
-            } for t, p in POS.items()
-        }
+        obj = {t: {
+            "qty": float(p.get("qty",0.0)),
+            "avg": float(p.get("avg",0.0)),
+            "entry_ts": p.get("entry_ts"),
+            "highest": float(p.get("highest",0.0)),
+            "trail_active": bool(p.get("trail_active", False)),
+            "partial_tp_done": bool(p.get("partial_tp_done", False)),
+            "cooldown_until": float(p.get("cooldown_until", 0.0)),
+        } for t, p in POS.items()}
     tmp = POS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, POS_FILE)
 
 def load_pos():
-    if not os.path.exists(POS_FILE):
-        return
+    if not os.path.exists(POS_FILE): return
     try:
         with open(POS_FILE, "r", encoding="utf-8") as f:
             obj = json.load(f)
@@ -275,27 +266,18 @@ def load_pos():
                 "cooldown_until": float(p.get("cooldown_until", 0.0)),
             }
 
-def append_csv(row: dict):
-    header = ["ts","ticker","side","qty","price","krw","fee","pnl_krw","pnl_pct","note"]
-    exists = os.path.exists(CSV_FILE)
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
-
 # ================= Exchange helpers =================
-def get_balance_krw():
-    try:
-        return float(UPBIT.get_balance("KRW") or 0.0)
-    except Exception:
-        return 0.0
+def _to_sym(ticker_or_sym: str) -> str:
+    # "KRW-ABC" -> "ABC"
+    return ticker_or_sym.split("-")[1] if "-" in ticker_or_sym else ticker_or_sym
 
-def get_balance_coin(ticker):
-    try:
-        return float(UPBIT.get_balance(ticker) or 0.0)
-    except Exception:
-        return 0.0
+def get_balance_krw():
+    try: return float(UPBIT.get_balance("KRW") or 0.0)
+    except Exception: return 0.0
+
+def get_balance_coin(ticker_or_sym: str):
+    try: return float(UPBIT.get_balance(_to_sym(ticker_or_sym)) or 0.0)
+    except Exception: return 0.0
 
 def get_exchange_avg_map():
     out = {}
@@ -303,37 +285,31 @@ def get_exchange_avg_map():
         bals = UPBIT.get_balances()
         for b in bals or []:
             cur = b.get("currency")
-            if not cur:
-                continue
+            if not cur: continue
             m = "KRW-"+cur.upper()
             qty = float(b.get("balance") or 0.0)
-            if qty <= 0:
-                continue
+            if qty <= 0: continue
             avg = float(b.get("avg_buy_price") or 0.0)
-            out[m] = avg if avg > 0 else None
+            out[m] = avg if avg>0 else None
     except Exception as e:
         print(f"[avg_map] {e}")
     return out
 
-# ================= Safe Order Module (BUY/SELL + Dust) =================
-from collections import defaultdict
+# ================= Safe Orders =================
 _last_order_at = defaultdict(lambda: 0.0)
-_symbol_cool   = defaultdict(lambda: 0.0)
 _lock_per_sym  = defaultdict(lambda: threading.Lock())
+ORDER_COOLDOWN, MAX_RETRIES, BASE_SLEEP = 3.0, 5, 0.6
+DUST_LIMIT = float(os.getenv("DUST_LIMIT", "2000"))
 
-ORDER_COOLDOWN = 3.0
-MAX_RETRIES    = 5
-BASE_SLEEP     = 0.6
-DUST_LIMIT     = 2000.0  # 평가금액 이하면 dust로 전량 정리 시도
+def _now(): return time.time()
+def _enforce(sym):
+    since = _now() - _last_order_at[sym]
+    if since < ORDER_COOLDOWN: time.sleep(ORDER_COOLDOWN - since)
 
-def _now():
-    return time.time()
-
-def _round_down_qty(qty: float, decimals: int = 6) -> float:
-    if qty <= 0:
-        return 0.0
-    factor = 10 ** decimals
-    return math.floor(qty * factor) / factor
+def _round_down_qty(q, d=6):
+    if q <= 0: return 0.0
+    f = 10**d
+    return math.floor(q*f)/f
 
 def _get_price_with_retry(market: str, attempts: int = 4):
     wait = 0.2
@@ -345,13 +321,8 @@ def _get_price_with_retry(market: str, attempts: int = 4):
         wait *= 1.6
     return None
 
-def _enforce_rate_limit(symbol: str):
-    since = _now() - _last_order_at[symbol]
-    if since < ORDER_COOLDOWN:
-        time.sleep(ORDER_COOLDOWN - since)
-
 def safe_sell_market(upbit, market: str, portion: float = 1.0):
-    sym = market.split("-")[1].upper()
+    sym = _to_sym(market)
     lock = _lock_per_sym[sym]
     with lock:
         try:
@@ -364,7 +335,7 @@ def safe_sell_market(upbit, market: str, portion: float = 1.0):
             qty = _round_down_qty(bal * portion, 6)
             est = qty * price
 
-            # dust 전량 정리
+            # dust 정리
             if est < MIN_ORDER_KRW:
                 if est < DUST_LIMIT:
                     resp = None
@@ -373,33 +344,29 @@ def safe_sell_market(upbit, market: str, portion: float = 1.0):
                             resp = upbit.sell_market_order(market, bal)
                         except Exception:
                             resp = None
-                        if resp:
-                            break
+                        if resp: break
                         time.sleep(0.5)
                     return {"status": "DUST_CLEAN" if resp else "FAIL", "resp": resp}
                 return {"status": "SKIP", "reason": "under_min_order", "resp": None}
 
             # 정상 매도
-            resp = None
-            wait = BASE_SLEEP
+            resp = None; wait = BASE_SLEEP
             for _ in range(MAX_RETRIES):
-                _enforce_rate_limit(sym)
+                _enforce(sym)
                 try:
                     resp = upbit.sell_market_order(market, qty)
                 except Exception:
                     resp = None
                 _last_order_at[sym] = _now()
-                if resp:
-                    break
-                time.sleep(wait)
-                wait *= 1.5
+                if resp: break
+                time.sleep(wait); wait *= 1.5
             return {"status": "OK", "resp": resp} if resp else {"status": "FAIL", "reason": "resp_none_all_retry", "resp": None}
         except Exception as e:
             traceback.print_exc()
             return {"status": "ERROR", "reason": str(e), "resp": None}
 
 def safe_buy_market(upbit, market: str, krw_amount: float):
-    sym = market.split("-")[1].upper()
+    sym = _to_sym(market)
     lock = _lock_per_sym[sym]
     with lock:
         try:
@@ -412,19 +379,16 @@ def safe_buy_market(upbit, market: str, krw_amount: float):
             krw_before = get_balance_krw()
             coin_before = get_balance_coin(sym)
 
-            resp = None
-            wait = BASE_SLEEP
+            resp = None; wait = BASE_SLEEP
             for _ in range(MAX_RETRIES):
-                _enforce_rate_limit(sym)
+                _enforce(sym)
                 try:
                     resp = upbit.buy_market_order(market, krw_amount * 0.9990)
                 except Exception:
                     resp = None
                 _last_order_at[sym] = _now()
-                if resp:
-                    break
-                time.sleep(wait)
-                wait *= 1.5
+                if resp: break
+                time.sleep(wait); wait *= 1.5
 
             if not resp:
                 return {"status": "FAIL", "reason": "resp_none_all_retry", "resp": None}
@@ -446,7 +410,7 @@ def safe_buy_market(upbit, market: str, krw_amount: float):
             traceback.print_exc()
             return {"status": "ERROR", "reason": str(e), "resp": None}
 
-# ================= Indicators (EMA/RSI) =================
+# ================= Indicators =================
 def ema(series, length):
     import pandas as pd
     s = pd.Series(series)
@@ -471,9 +435,9 @@ def on_rate_error():
     BACKOFF["sleep_ohlcv"] *= 1.5
     send_telegram(f"🧯 백오프 적용: TOPN={BACKOFF['topn']}, scan={BACKOFF['scan_interval']}s")
 
-# ================= Scanner (IPR 진입) =================
+# ================= Scanner helpers =================
 TICKER_URL = "https://api.upbit.com/v1/ticker"
-_last_scan_summary_ts = 0.0
+_last_scan_summary_ts = 0.0  # 10분 간격 요약
 
 def fetch_top_by_turnover(krw_tickers, topn):
     res = []
@@ -482,16 +446,13 @@ def fetch_top_by_turnover(krw_tickers, topn):
             chunk = krw_tickers[i:i+REQ_CHUNK]
             r = requests.get(TICKER_URL, params={"markets": ",".join(chunk)}, timeout=5)
             if r.status_code == 429:
-                on_rate_error()
-                continue
+                on_rate_error(); continue
             r.raise_for_status()
             data = r.json()
             for d in data:
-                res.append({
-                    "market": d["market"],
-                    "price": float(d["trade_price"]),
-                    "turnover24h": float(d.get("acc_trade_price_24h", 0.0))
-                })
+                res.append({"market": d["market"],
+                            "price": float(d["trade_price"]),
+                            "turnover24h": float(d.get("acc_trade_price_24h", 0.0))})
             time.sleep(BACKOFF["sleep_ticker"])
         res.sort(key=lambda x: x["turnover24h"], reverse=True)
         return res[:topn]
@@ -499,10 +460,11 @@ def fetch_top_by_turnover(krw_tickers, topn):
         send_telegram(f"⚠️ 거래대금 조회 실패: {e}")
         return []
 
+# ================= Scanner (Bottom-Reversal Entry) =================
 def scan_once_and_maybe_buy():
     global _last_scan_summary_ts
 
-    # 09:00 변동성 보호
+    # 09:00 변동성 보호: 09시부터 N분간 신규진입 스킵
     kst = now_kst()
     if kst.hour == 9 and kst.minute < NO_TRADE_MIN_AROUND_9:
         if time.time() - _last_scan_summary_ts > 600:
@@ -510,7 +472,7 @@ def scan_once_and_maybe_buy():
             send_telegram("⏸ 09:00 변동성 보호로 신규 진입 스킵")
         return
 
-    # 슬롯 확인
+    # 현재 보유/빈 슬롯
     with POS_LOCK:
         open_cnt = sum(1 for _, p in POS.items() if p.get("qty",0.0) > 0.0)
     free_slots = max(0, MAX_OPEN_POSITIONS - open_cnt)
@@ -520,23 +482,21 @@ def scan_once_and_maybe_buy():
             send_telegram("🔎 스캔요약: 후보 0 / free_slots=0 (슬롯 가득)")
         return
 
-    # 유니버스 필터
+    # 유니버스 구성
     try:
         krw_tickers = [t for t in pyupbit.get_tickers("KRW") if t not in EXCLUDED_TICKERS]
     except Exception as e:
         send_telegram(f"⚠️ 티커 조회 실패: {e}")
         return
-    now = time.time()
+    now_epoch = time.time()
     universe = []
     for t in krw_tickers:
-        if COOLDOWN.get(t, 0.0) > now:
-            continue
+        if COOLDOWN.get(t, 0.0) > now_epoch: continue
         with POS_LOCK:
-            if t in POS and POS[t].get("qty",0.0) > 0.0:
-                continue
+            if t in POS and POS[t].get("qty",0.0) > 0.0: continue
         universe.append(t)
 
-    # TOPN
+    # 거래대금 TOPN
     topN = fetch_top_by_turnover(universe, BACKOFF["topn"])
     if not topN:
         if time.time() - _last_scan_summary_ts > 600:
@@ -544,76 +504,69 @@ def scan_once_and_maybe_buy():
             send_telegram(f"🔎 스캔요약: 후보 0 / TOPN={BACKOFF['topn']}")
         return
 
-    # 후보 스코어링 + IPR 조건
+    # 후보 스코어링: 바닥 반등 조건
     cands = []
     for it in topN:
         t = it["market"]
         price = it["price"]
-        if price < MIN_PRICE_KRW:
-            continue
+        if price < MIN_PRICE_KRW: continue
+
         df = get_ohlcv_safe(t, count=max(LOOKBACK_MIN+20, 40))
-        if df is None or len(df) < LOOKBACK_MIN + 5:
-            continue
+        if df is None or len(df) < 20: continue
 
         closes = df["close"].tolist()
         highs  = df["high"].tolist()
+        lows   = df["low"].tolist()
         vols   = df["volume"].tolist()
 
-        ref = closes[-(LOOKBACK_MIN+1)]
-        last = closes[-1]
-        pct_up = (last - ref) / ref * 100.0
-
-        vals = [c*v for c, v in zip(closes, vols)]
-        past_avg = sum(vals[-(LOOKBACK_MIN+1):-1]) / LOOKBACK_MIN
-        recent = vals[-1]
-        spike = (recent / past_avg) if past_avg > 0 else 0.0
-        if pct_up < MIN_PCT_UP or spike < VOL_SPIKE_MULT:
-            continue
-
-        ema10 = ema(closes, EMA_LEN)
+        ema10 = ema(closes, 10)
+        ema20 = ema(closes, 20)
         rsi14 = rsi14_from_ohlcv(df)
 
-        swing_high = max(highs[-(LOOKBACK_MIN//2 + 5):])
-        pb_low  = swing_high * (1 - PB_MAX_PCT/100.0)
-        pb_high = swing_high * (1 - PB_MIN_PCT/100.0)
-
         last_close = closes[-1]
-        prev_high  = highs[-2] if len(highs) >= 2 else last_close
-        ema_ok = last_close >= (ema10[-1] or last_close)
-        rsi_ok = (rsi14[-1] if isinstance(rsi14[-1], (int, float)) else 50.0) <= RSI_MAX_BUY
-        resumption = last_close > prev_high * 1.001  # 0.1% 미세 돌파
-        in_pb_zone = (pb_low <= last_close <= pb_high)
+        lowest_recent = min(lows[-5:])          # 최근 5봉 저가 중 최저
+        vol_avg = (sum(vols[-11:-1])/10) if len(vols) > 10 else (sum(vols)/len(vols))
+        vol_now = vols[-1]
 
-        if in_pb_zone and ema_ok and rsi_ok and resumption:
-            score = pct_up*0.7 + min(spike,5.0)*6.0 + 3.0
-            cands.append((t, score, last, it["turnover24h"]))
+        # 조건
+        cond_rsi = rsi14[-1] <= RSI_MAX_BOTTOM
+        cond_ema = (last_close >= ema10[-1]* (1 - EMA_NEAR_PCT/100.0)) and (last_close >= ema20[-1]* (1 - EMA_NEAR_PCT/100.0))
+        cond_rebound = last_close >= lowest_recent * (1 + REBOUND_FROM_LOW_PCT/100.0)
+        cond_vol = vol_now >= vol_avg * VOL_BOOST_MULT
+
+        if cond_rsi and cond_ema and cond_rebound and cond_vol:
+            # 점수: RSI 낮을수록, 거래량 많을수록 우선
+            score = (RSI_MAX_BOTTOM - rsi14[-1]) + (vol_now / max(1e-9, vol_avg))
+            cands.append((t, score, last_close, it["turnover24h"]))
+
         time.sleep(BACKOFF["sleep_ohlcv"]*(0.8 + 0.4*random.random()))
 
-    # 자금 산정
+    # 자금 계산
     krw_total = get_balance_krw()
     target_used = krw_total * (1.0 - CASH_BUFFER_PCT)
+
     inuse = 0.0
     with POS_LOCK:
-        for t, p in POS.items():
+        for t_, p in POS.items():
             if p.get("qty",0.0) > 0:
-                pr = get_price_safe(t) or p["avg"]
-                inuse += p["qty"] * pr
+                pr = get_price_safe(t_) or p["avg"]
+                inuse += p["qty"]*pr
     krw_left = max(0.0, target_used - inuse)
 
+    # 10분 요약
     if time.time() - _last_scan_summary_ts > 600:
         _last_scan_summary_ts = time.time()
-        est_per_slot = (krw_left / free_slots) if free_slots > 0 else 0.0
+        est_per_slot = (krw_left / free_slots) if free_slots>0 else 0.0
         send_telegram(f"🔎 스캔요약: 후보 {len(cands)} / TOPN={BACKOFF['topn']} / free_slots={free_slots} / per_slot≈₩{est_per_slot:,.0f}")
 
-    if not cands or krw_left < MIN_ORDER_KRW:
-        return
+    if not cands or krw_left < MIN_ORDER_KRW: return
 
     per_slot = krw_left / free_slots
     if per_slot < MIN_ORDER_KRW:
         send_telegram(f"⏸ 매수 스킵: per_slot ₩{per_slot:,.0f} < 최소주문 ₩{MIN_ORDER_KRW:,.0f}")
         return
 
-    # 진입
+    # 진입: 점수 높은 순
     cands.sort(key=lambda x: (x[1], x[3]), reverse=True)
     picks = cands[:free_slots]
     for (t, _, __, ___) in picks:
@@ -632,10 +585,8 @@ def scan_once_and_maybe_buy():
                 }
             save_pos()
             tg_buy(t, qty, avg, spent)
-            append_csv({
-                "ts": now_str(), "ticker": t, "side": "BUY", "qty": qty, "price": avg,
-                "krw": -spent, "fee": spent*FEE_RATE, "pnl_krw": 0, "pnl_pct": 0, "note": "scanner_entry(IPR)"
-            })
+            append_csv({"ts": now_str(),"ticker": t,"side":"BUY","qty": qty,"price": avg,
+                        "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"bottom_entry"})
 
 # ================= Manager (TP/SL/Trailing/Partial) =================
 def manage_positions_once():
@@ -644,38 +595,36 @@ def manage_positions_once():
 
     for t, p in items:
         qty = p.get("qty",0.0)
-        if qty <= 0:
-            continue
+        if qty <= 0: continue
         avg = p.get("avg",0.0)
         price = get_price_safe(t)
-        if not price or avg <= 0:
-            continue
+        if not price or avg<=0: continue
 
-        pnl_pct_now = (price - avg) / avg * 100.0
+        pnl_pct_now = (price-avg)/avg*100.0
 
         # Emergency hard stop
         if pnl_pct_now <= -HARD_STOP_PCT:
             sr = safe_sell_market(UPBIT, t, 1.0)
             if sr.get("status") in ("OK", "DUST_CLEAN"):
                 avg_sell = get_price_safe(t) or price
-                pnl_pct = ((avg_sell - avg) / avg) * 100.0
+                pnl_pct = ((avg_sell-avg)/avg)*100.0
                 tg_stop(t, avg_sell, qty, pnl_pct)
-                append_csv({
-                    "ts": now_str(),"ticker": t,"side":"EMERGENCY_STOP","qty": qty,"price": avg_sell,
-                    "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),
-                    "pnl_pct": pnl_pct,"note": f"hard_stop{-HARD_STOP_PCT:.1f}%"
+                append_csv({"ts": now_str(),"ticker": t,"side":"EMERGENCY_STOP","qty": qty,"price": avg_sell,
+                            "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),"pnl_pct": pnl_pct,
+                            "note": f"hard_stop{-HARD_STOP_PCT:.1f}%"
                 })
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
-                    POS[t]["cooldown_until"] = time.time() + 5400
+                    POS[t]["cooldown_until"] = time.time() + 5400  # 90분
                     COOLDOWN[t] = POS[t]["cooldown_until"]
                 save_pos()
             continue
 
-        highest = max(p.get("highest", avg), price)
+        highest = max(p.get("highest",avg), price)
         trail_active = p.get("trail_active", False)
         partial_done = p.get("partial_tp_done", False)
 
+        # 트레일 활성화(+TRAIL_ACTIVATE_PCT%)
         if (not trail_active) and pnl_pct_now >= TRAIL_ACTIVATE_PCT:
             trail_active = True
             send_telegram(f"🛡️ 트레일 활성화: {t} peak={highest:.4f} | line {TRAIL_PCT:.2f}%")
@@ -684,62 +633,59 @@ def manage_positions_once():
         trail_line = highest*(1 - TRAIL_PCT/100.0) if trail_active else sl_price
         dyn_sl = max(sl_price, trail_line) if trail_active else sl_price
 
+        # 1) 동적SL 터치 (전량)
         if price <= dyn_sl and pnl_pct_now < TP_PCT:
             sr = safe_sell_market(UPBIT, t, 1.0)
-            if sr.get("status") in ("OK", "DUST_CLEAN"):
+            if sr.get("status") in ("OK","DUST_CLEAN"):
                 avg_sell = get_price_safe(t) or price
-                pnl_pct = ((avg_sell - avg) / avg) * 100.0
+                pnl_pct = ((avg_sell-avg)/avg)*100.0
                 end_reason = "손절" if pnl_pct < 0 else "트레일링"
                 cd_min = 90 if (pnl_pct < 0 and not partial_done) else 30
                 if pnl_pct < 0:
                     tg_stop(t, avg_sell, qty, pnl_pct)
                 else:
                     tg_trailing(t, avg_sell, qty, pnl_pct)
-                append_csv({
-                    "ts": now_str(),"ticker": t,"side":"STOP/TRAIL","qty": qty,"price": avg_sell,
-                    "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),
-                    "pnl_pct": pnl_pct,"note": "dyn_sl"
-                })
+                append_csv({"ts": now_str(),"ticker": t,"side":"STOP/TRAIL","qty": qty,"price": avg_sell,
+                            "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),"pnl_pct": pnl_pct,
+                            "note": "dyn_sl"})
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
-                    POS[t]["cooldown_until"] = time.time() + cd_min * 60
+                    POS[t]["cooldown_until"] = time.time() + cd_min*60
                     COOLDOWN[t] = POS[t]["cooldown_until"]
                 save_pos()
                 tg_cooldown(t, end_reason, cd_min)
             continue
 
-        if (not partial_done) and pnl_pct_now >= TP_PCT:
+        # 2) 부분익절 50% (1회)
+        if (not partial_done) and (pnl_pct_now >= TP_PCT):
             sr = safe_sell_market(UPBIT, t, PARTIAL_TP_RATIO)
             if sr.get("status") == "OK":
                 avg_sell = get_price_safe(t) or price
                 filled = qty * PARTIAL_TP_RATIO
-                pnl_pct = ((avg_sell - avg) / avg) * 100.0
+                pnl_pct = ((avg_sell-avg)/avg)*100.0
                 left_after = max(0.0, qty - filled)
                 tg_partial(t, filled, avg_sell, filled*(avg_sell-avg), pnl_pct, left_after)
-                append_csv({
-                    "ts": now_str(),"ticker": t,"side":"PARTIAL_TP","qty": filled,"price": avg_sell,
-                    "krw": filled*avg_sell,"fee": filled*avg_sell*FEE_RATE,"pnl_krw": filled*(avg_sell-avg),
-                    "pnl_pct": pnl_pct,"note":"partial@2.5%"
-                })
+                append_csv({"ts": now_str(),"ticker": t,"side":"PARTIAL_TP","qty": filled,"price": avg_sell,
+                            "krw": filled*avg_sell,"fee": filled*avg_sell*FEE_RATE,"pnl_krw": filled*(avg_sell-avg),
+                            "pnl_pct": pnl_pct,"note":"partial@2.5%"})
                 with POS_LOCK:
                     POS[t]["qty"] = left_after
                     POS[t]["partial_tp_done"] = True
-                    POS[t]["highest"] = max(highest, price)
+                    POS[t]["highest"] = max(POS[t]["highest"], price)
                     POS[t]["trail_active"] = True
                 save_pos()
                 continue
 
-        if trail_active and price <= highest*(1 - TRAIL_PCT/100.0):
+        # 3) 트레일 라인 터치로 잔량 전량 청산
+        if trail_active and price <= (highest*(1 - TRAIL_PCT/100.0)):
             sr = safe_sell_market(UPBIT, t, 1.0)
-            if sr.get("status") in ("OK", "DUST_CLEAN"):
+            if sr.get("status") in ("OK","DUST_CLEAN"):
                 avg_sell = get_price_safe(t) or price
-                pnl_pct = ((avg_sell - avg) / avg) * 100.0
+                pnl_pct = ((avg_sell-avg)/avg)*100.0
                 tg_trailing(t, avg_sell, qty, pnl_pct)
-                append_csv({
-                    "ts": now_str(),"ticker": t,"side":"TRAIL","qty": qty,"price": avg_sell,
-                    "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),
-                    "pnl_pct": pnl_pct,"note":"trail_hit"
-                })
+                append_csv({"ts": now_str(),"ticker": t,"side":"TRAIL","qty": qty,"price": avg_sell,
+                            "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),"pnl_pct": pnl_pct,
+                            "note":"trail_hit"})
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
                     POS[t]["cooldown_until"] = time.time() + (1800 if partial_done else 5400)
@@ -748,6 +694,7 @@ def manage_positions_once():
                 tg_cooldown(t, "트레일링", 30 if partial_done else 90)
                 continue
 
+        # 상태 갱신(메모리)
         with POS_LOCK:
             POS[t]["highest"] = highest
             POS[t]["trail_active"] = trail_active
@@ -761,8 +708,7 @@ def tz_now():
         return datetime.now()
 
 def read_csv_rows():
-    if not os.path.exists(CSV_FILE):
-        return []
+    if not os.path.exists(CSV_FILE): return []
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         return list(csv.DictReader(f))
 
@@ -770,11 +716,7 @@ def summarize_between(start_dt_kst, end_dt_kst):
     rows = read_csv_rows()
     s = start_dt_kst.astimezone(KST)
     e = end_dt_kst.astimezone(KST)
-    realized = 0.0
-    cnt = 0
-    wins = 0
-    losses = 0
-    pnl_pct_sum = 0.0
+    realized = 0.0; cnt=0; wins=0; losses=0; pnl_pct_sum=0.0
     for r in rows:
         ts = r.get("ts") or r.get("시간") or ""
         try:
@@ -782,17 +724,17 @@ def summarize_between(start_dt_kst, end_dt_kst):
         except Exception:
             continue
         dt = dt.replace(tzinfo=KST)
-        if not (s <= dt <= e):
-            continue
+        if not (s <= dt <= e): continue
         side = (r.get("side") or r.get("구분(익절/손절)") or "")
         if side:
             cnt += 1
-            if "익절" in side or "TRAIL" in side or "PARTIAL" in side:
-                wins += 1
-            if "손절" in side or "STOP" in side:
-                losses += 1
-        realized += float(str(r.get("pnl_krw","0")).replace(",",""))
-        pnl_pct_sum += float(str(r.get("pnl_pct","0")).replace(",",""))
+            if "익절" in side or "TRAIL" in side or "PARTIAL" in side: wins += 1
+            if "손절" in side or "STOP" in side: losses += 1
+        try:
+            realized += float(str(r.get("pnl_krw","0")).replace(",",""))
+            pnl_pct_sum += float(str(r.get("pnl_pct","0")).replace(",",""))
+        except Exception:
+            pass
     avg_pct = (pnl_pct_sum/cnt) if cnt else 0.0
     winrate = (wins/cnt*100.0) if cnt else 0.0
     return {"count":cnt,"wins":wins,"losses":losses,"realized_krw":realized,"avg_pnl_pct":avg_pct,"winrate":winrate}
@@ -815,14 +757,14 @@ def build_daily_report():
     total_hold_val = 0.0
     for t, p in holdings:
         qty = p.get("qty",0.0)
-        if qty <= 0:
-            continue
+        if qty<=0: continue
         price = get_price_safe(t) or 0.0
-        if price <= 0:
-            continue
+        if price<=0: continue
         val = qty*price
         total_hold_val += val
-        lines.append(f"• {t} qty {qty:.6f} @avg {p.get('avg',0.0):.4f} / now {price:.4f}")
+        avg = p.get("avg",0.0)
+        upct = ((price-avg)/avg*100.0) if avg>0 else 0.0
+        lines.append(f"• {t} qty {qty:.6f} @avg {avg:.4f} / now {price:.4f} → {upct:.2f}%")
 
     krw = get_balance_krw()
     total_assets = krw + total_hold_val
@@ -830,7 +772,8 @@ def build_daily_report():
     msg = (
         f"📊 [일일 리포트] {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_TZ})\n"
         f"거래수 {met['count']} (승 {met['wins']}/패 {met['losses']} | 승률 {met['winrate']:.1f}%) | 평균손익률 {met['avg_pnl_pct']:.2f}%\n\n"
-        f"보유자산(코인) ₩{total_hold_val:,.0f} | 현금 ₩{krw:,.0f} | 총자산 ₩{total_assets:,.0f}"
+        f"🔹 보유자산\n" + ("\n".join(lines) if lines else "• (없음)") + "\n\n"
+        f"💼 보유금액(코인) ₩{total_hold_val:,.0f} | 현금 ₩{krw:,.0f} | 총자산 ₩{total_assets:,.0f}"
     )
     return msg
 
@@ -890,6 +833,7 @@ def manager_loop():
 def init_bot():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
+    # 간단 진단: 권한/허용IP/레이트리밋
     try:
         payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
         token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
@@ -899,14 +843,15 @@ def init_bot():
             send_telegram(f"❗️업비트 인증/허용IP/레이트리밋 점검: {r.status_code}")
     except Exception as e:
         print(f"[diag] {e}")
+
     load_pos()
     send_telegram("🤖 봇 시작됨")
     send_telegram(
-        f"⚙️ thresholds | 10m≥+{MIN_PCT_UP:.1f}% & 1m×≥{VOL_SPIKE_MULT:.2f} | "
+        f"⚙️ thresholds | Bottom: RSI≤{RSI_MAX_BOTTOM:.0f}, EMA±{EMA_NEAR_PCT:.1f}%, "
+        f"Rebound≥{REBOUND_FROM_LOW_PCT:.1f}%, Vol≥×{VOL_BOOST_MULT:.2f} | "
         f"SL={SL_PCT:.2f}% | TP(partial@{TP_PCT:.1f}%, {int(PARTIAL_TP_RATIO*100)}%) | "
         f"TRAIL act {TRAIL_ACTIVATE_PCT:.1f}% / line {TRAIL_PCT:.1f}% | "
-        f"hard_stop {HARD_STOP_PCT:.1f}% | IPR pb {PB_MIN_PCT:.1f}~{PB_MAX_PCT:.1f}% | RSI≤{RSI_MAX_BUY:.0f} | EMA{EMA_LEN} | "
-        f"manager {MANAGER_TICK_MS}ms | TOPN={BACKOFF['topn']}"
+        f"hard_stop {HARD_STOP_PCT:.1f}% | manager {MANAGER_TICK_MS}ms | TOPN={BACKOFF['topn']}"
     )
 
 def start_threads():
@@ -923,8 +868,6 @@ if not getattr(app, "_bot_started", False):
 # ================= __main__ =================
 if __name__ == "__main__":
     if not getattr(app, "_bot_started", False):
-        init_bot()
-        start_threads()
-        app._bot_started = True
+        init_bot(); start_threads(); app._bot_started = True
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
