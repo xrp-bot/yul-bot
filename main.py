@@ -718,7 +718,7 @@ def reporter_loop():
                 continue
             time.sleep(30)
         except Exception:
-            print(f"[reporter] {traceback.format_exc()]}")
+            print(f"[reporter] {traceback.format_exc()}")
             time.sleep(5)
 
 # ================= Loops =================
