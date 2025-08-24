@@ -1,14 +1,14 @@
 """
 main.py — Upbit Multi-Asset Gainer Scanner Bot (24h)
-Strategy: Bottom-Reversal Entry + SafeOrders + Manager + Daily Reporter
+Strategy: Bottom-Reversal Entry + Reserved Slot Budget (45%×2) + SafeOrders + Manager + Reporter
 Spec (2025-08):
 - Scanner: 거래대금 TOPN → 바닥 반등 조건(RSI≤35, EMA10/20 지지, 저점대비 +1% 반등, 거래량↑) 충족 시 매수
-- Capital: 현금 버퍼 10%, 동시 보유 2종목, 잔여현금/잔여슬롯 균등 배분
+- Capital: 총예산=현금×(1−CASH_BUFFER_PCT), 슬롯=MAX_OPEN_POSITIONS(기본 2). per_slot=총예산/슬롯 → 45%씩 고정
 - Sell: 손절 -1.2% → 부분익절 50% @ +2.5%(1회) → 트레일링(최고가 -1.5%)
 - Emergency Hard Stop: ≤ -2.5% 즉시 전량 청산
 - Cooldown: 부분익절 경험 30분 / 그 외 90분
 - Reporter: 매일 09:00:15 KST 텔레그램 리포트
-- Safety: Safe BUY/SELL(재시도·락·dust정리·최소주문 체크), 09:00 변동성 보호, 레이트리밋 백오프
+- Safety: SafeOrders(재시도·락·dust정리·최소주문 체크), 09:00 변동성 보호, 레이트리밋 백오프
 - Render/Gunicorn 호환: import-time autostart
 """
 
@@ -52,7 +52,7 @@ def reconcile():
         changed = 0
         with POS_LOCK:
             for t, p in list(POS.items()):
-                qty_ex = get_balance_coin(t)  # KRW-XXX 가능
+                qty_ex = get_balance_coin(t)
                 if qty_ex <= 0:
                     if POS[t].get("qty", 0.0) != 0.0:
                         POS[t]["qty"] = 0.0
@@ -77,14 +77,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Capital & risk
 CASH_BUFFER_PCT        = float(os.getenv("CASH_BUFFER_PCT", "0.10"))  # 10%
 MAX_OPEN_POSITIONS     = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5500"))
+MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5000"))     # 업비트 최소주문 5천원 권장
 FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))       # 0.05%
 
 # Scanner 기본
-SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))    # 45초
-TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "40"))         # TOP 40
+SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))
+TOPN_INITIAL           = int(os.getenv("TOPN_INITIAL", "60"))
 VOL_SPIKE_MULT         = float(os.getenv("VOL_SPIKE_MULT", "1.5"))    # 바닥전략: 1.5배로 완화
-LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))         # 10분
+LOOKBACK_MIN           = int(os.getenv("LOOKBACK_MIN", "10"))
 MIN_PRICE_KRW          = float(os.getenv("MIN_PRICE_KRW", "100"))
 EXCLUDED_TICKERS       = set([t.strip() for t in os.getenv("EXCLUDED_TICKERS","KRW-BTC,KRW-ETH").split(",") if t.strip()])
 
@@ -118,6 +118,7 @@ PERSIST_DIR            = os.getenv("PERSIST_DIR", "./")
 os.makedirs(PERSIST_DIR, exist_ok=True)
 CSV_FILE               = os.path.join(PERSIST_DIR, "trades.csv")
 POS_FILE               = os.path.join(PERSIST_DIR, "pos.json")
+SLOT_BUDGET_FILE       = os.path.join(PERSIST_DIR, "slot_budget.json")
 
 # Rate-limit/backoff
 REQ_CHUNK              = 90
@@ -266,9 +267,23 @@ def load_pos():
                 "cooldown_until": float(p.get("cooldown_until", 0.0)),
             }
 
+# ===== Reserved Slot Budget (45%×2) =====
+def load_slot_budget():
+    if not os.path.exists(SLOT_BUDGET_FILE): return {}
+    try:
+        with open(SLOT_BUDGET_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_slot_budget(b):
+    tmp = SLOT_BUDGET_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(b, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SLOT_BUDGET_FILE)
+
 # ================= Exchange helpers =================
 def _to_sym(ticker_or_sym: str) -> str:
-    # "KRW-ABC" -> "ABC"
     return ticker_or_sym.split("-")[1] if "-" in ticker_or_sym else ticker_or_sym
 
 def get_balance_krw():
@@ -335,7 +350,6 @@ def safe_sell_market(upbit, market: str, portion: float = 1.0):
             qty = _round_down_qty(bal * portion, 6)
             est = qty * price
 
-            # dust 정리
             if est < MIN_ORDER_KRW:
                 if est < DUST_LIMIT:
                     resp = None
@@ -349,7 +363,6 @@ def safe_sell_market(upbit, market: str, portion: float = 1.0):
                     return {"status": "DUST_CLEAN" if resp else "FAIL", "resp": resp}
                 return {"status": "SKIP", "reason": "under_min_order", "resp": None}
 
-            # 정상 매도
             resp = None; wait = BASE_SLEEP
             for _ in range(MAX_RETRIES):
                 _enforce(sym)
@@ -393,7 +406,6 @@ def safe_buy_market(upbit, market: str, krw_amount: float):
             if not resp:
                 return {"status": "FAIL", "reason": "resp_none_all_retry", "resp": None}
 
-            # 체결 확인
             t0 = time.time()
             while time.time() - t0 < 30:
                 if get_balance_coin(sym) > coin_before + 1e-9:
@@ -437,7 +449,7 @@ def on_rate_error():
 
 # ================= Scanner helpers =================
 TICKER_URL = "https://api.upbit.com/v1/ticker"
-_last_scan_summary_ts = 0.0  # 10분 간격 요약
+_last_scan_summary_ts = 0.0
 
 def fetch_top_by_turnover(krw_tickers, topn):
     res = []
@@ -460,11 +472,11 @@ def fetch_top_by_turnover(krw_tickers, topn):
         send_telegram(f"⚠️ 거래대금 조회 실패: {e}")
         return []
 
-# ================= Scanner (Bottom-Reversal Entry) =================
+# ================= Scanner (Bottom-Reversal Entry + Reserved Slot Budget) =================
 def scan_once_and_maybe_buy():
     global _last_scan_summary_ts
 
-    # 09:00 변동성 보호: 09시부터 N분간 신규진입 스킵
+    # 09:00 변동성 보호
     kst = now_kst()
     if kst.hour == 9 and kst.minute < NO_TRADE_MIN_AROUND_9:
         if time.time() - _last_scan_summary_ts > 600:
@@ -482,7 +494,7 @@ def scan_once_and_maybe_buy():
             send_telegram("🔎 스캔요약: 후보 0 / free_slots=0 (슬롯 가득)")
         return
 
-    # 유니버스 구성
+    # 유니버스
     try:
         krw_tickers = [t for t in pyupbit.get_tickers("KRW") if t not in EXCLUDED_TICKERS]
     except Exception as e:
@@ -524,69 +536,107 @@ def scan_once_and_maybe_buy():
         rsi14 = rsi14_from_ohlcv(df)
 
         last_close = closes[-1]
-        lowest_recent = min(lows[-5:])          # 최근 5봉 저가 중 최저
-        vol_avg = (sum(vols[-11:-1])/10) if len(vols) > 10 else (sum(vols)/len(vols))
+        lowest_recent = min(lows[-5:])
+        vol_avg = (sum(vols[-11:-1])/10) if len(vols) > 10 else (sum(vols)/max(1,len(vols)))
         vol_now = vols[-1]
 
-        # 조건
         cond_rsi = rsi14[-1] <= RSI_MAX_BOTTOM
-        cond_ema = (last_close >= ema10[-1]* (1 - EMA_NEAR_PCT/100.0)) and (last_close >= ema20[-1]* (1 - EMA_NEAR_PCT/100.0))
+        cond_ema = (last_close >= ema10[-1]*(1 - EMA_NEAR_PCT/100.0)) and (last_close >= ema20[-1]*(1 - EMA_NEAR_PCT/100.0))
         cond_rebound = last_close >= lowest_recent * (1 + REBOUND_FROM_LOW_PCT/100.0)
         cond_vol = vol_now >= vol_avg * VOL_BOOST_MULT
 
         if cond_rsi and cond_ema and cond_rebound and cond_vol:
-            # 점수: RSI 낮을수록, 거래량 많을수록 우선
             score = (RSI_MAX_BOTTOM - rsi14[-1]) + (vol_now / max(1e-9, vol_avg))
             cands.append((t, score, last_close, it["turnover24h"]))
 
         time.sleep(BACKOFF["sleep_ohlcv"]*(0.8 + 0.4*random.random()))
 
-    # 자금 계산
-    krw_total = get_balance_krw()
-    target_used = krw_total * (1.0 - CASH_BUFFER_PCT)
-
-    inuse = 0.0
+    # ===== Reserved Slot Budget 적용 =====
+    budget = load_slot_budget()
     with POS_LOCK:
-        for t_, p in POS.items():
-            if p.get("qty",0.0) > 0:
-                pr = get_price_safe(t_) or p["avg"]
-                inuse += p["qty"]*pr
-    krw_left = max(0.0, target_used - inuse)
+        open_cnt_now = sum(1 for _, p in POS.items() if p.get("qty",0.0) > 0.0)
+    need_init = (not budget) or ((budget.get("slots_left", 0) <= 0) and open_cnt_now == 0)
 
-    # 10분 요약
+    if need_init:
+        krw_now = get_balance_krw()
+        total_budget = math.floor(krw_now * (1.0 - CASH_BUFFER_PCT))  # 총예산 = 현금 90%
+        per_slot = total_budget / max(1, MAX_OPEN_POSITIONS)          # 슬롯당 45%
+        budget = {
+            "total_budget": total_budget,
+            "per_slot": per_slot,
+            "slots_left": MAX_OPEN_POSITIONS,
+            "spent_total": 0.0,
+        }
+        save_slot_budget(budget)
+
+    per_slot = budget["per_slot"]
+    slots_left = budget["slots_left"]
+    krw_cash = get_balance_krw()
+
+    if slots_left <= 0:
+        if time.time() - _last_scan_summary_ts > 600:
+            _last_scan_summary_ts = time.time()
+            send_telegram("🔎 스캔요약: 예약된 슬롯 예산 소진 — slots_left=0")
+        return
+
+    # 요약(10분)
     if time.time() - _last_scan_summary_ts > 600:
         _last_scan_summary_ts = time.time()
-        est_per_slot = (krw_left / free_slots) if free_slots>0 else 0.0
-        send_telegram(f"🔎 스캔요약: 후보 {len(cands)} / TOPN={BACKOFF['topn']} / free_slots={free_slots} / per_slot≈₩{est_per_slot:,.0f}")
+        reserved_left = max(0.0, budget["total_budget"] - budget["spent_total"])
+        send_telegram(
+            f"🔎 스캔요약: 후보 {len(cands)} / TOPN={BACKOFF['topn']} / "
+            f"slots_left={slots_left} / per_slot≈₩{per_slot:,.0f} / reserved_left≈₩{reserved_left:,.0f}"
+        )
 
-    if not cands or krw_left < MIN_ORDER_KRW: return
+    if not cands: return
 
-    per_slot = krw_left / free_slots
+    # 최소주문 체크
     if per_slot < MIN_ORDER_KRW:
         send_telegram(f"⏸ 매수 스킵: per_slot ₩{per_slot:,.0f} < 최소주문 ₩{MIN_ORDER_KRW:,.0f}")
         return
 
-    # 진입: 점수 높은 순
+    # 진입: 점수 높은 순으로, 예약 슬롯/빈 슬롯 범위 내에서 집행
     cands.sort(key=lambda x: (x[1], x[3]), reverse=True)
-    picks = cands[:free_slots]
-    for (t, _, __, ___) in picks:
-        br = safe_buy_market(UPBIT, t, per_slot)
+    buys_to_make = min(len(cands), free_slots, slots_left)
+    for i in range(buys_to_make):
+        t = cands[i][0]
+        krw_cash = get_balance_krw()
+        order_krw = min(per_slot, max(0.0, krw_cash - 1000.0))  # 수수료 여유
+        if order_krw < MIN_ORDER_KRW:
+            send_telegram(f"⏸ 매수 스킵: 잔액부족(현금 ₩{krw_cash:,.0f}, 필요 ₩{per_slot:,.0f})")
+            continue
+
+        br = safe_buy_market(UPBIT, t, order_krw)
         if br.get("status") == "OK" and br.get("qty", 0) > 0:
             avg, qty, spent = br["avg"], br["qty"], br["spent"]
             with POS_LOCK:
-                POS[t] = {
-                    "qty": float(qty),
-                    "avg": float(avg),
+                pos = POS.get(t, {"qty":0.0,"avg":0.0,"highest":0.0,"trail_active":False,"partial_tp_done":False,"cooldown_until":0.0})
+                tot_qty_before = pos["qty"]
+                tot_cost_before = tot_qty_before * (pos["avg"] or avg)
+                tot_qty_after = tot_qty_before + qty
+                new_avg = (tot_cost_before + spent) / tot_qty_after if tot_qty_after > 0 else avg
+                pos.update({
+                    "qty": tot_qty_after,
+                    "avg": new_avg,
                     "entry_ts": now_str(),
-                    "highest": float(avg),
-                    "trail_active": False,
-                    "partial_tp_done": False,
-                    "cooldown_until": 0.0,
-                }
+                    "highest": max(pos.get("highest", new_avg), new_avg),
+                })
+                POS[t] = pos
             save_pos()
             tg_buy(t, qty, avg, spent)
-            append_csv({"ts": now_str(),"ticker": t,"side":"BUY","qty": qty,"price": avg,
-                        "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"bottom_entry"})
+            append_csv({
+                "ts": now_str(),"ticker": t,"side": "BUY","qty": qty,"price": avg,
+                "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"slot_reserved_entry(bottom)"
+            })
+
+            # 슬롯 1개 소진
+            budget["spent_total"] += spent
+            budget["slots_left"] = max(0, budget["slots_left"] - 1)
+            save_slot_budget(budget)
+
+            time.sleep(1.0)
+        else:
+            send_telegram(f"⚠️ 매수 실패: {t} status={br.get('status')}")
 
 # ================= Manager (TP/SL/Trailing/Partial) =================
 def manage_positions_once():
@@ -624,7 +674,6 @@ def manage_positions_once():
         trail_active = p.get("trail_active", False)
         partial_done = p.get("partial_tp_done", False)
 
-        # 트레일 활성화(+TRAIL_ACTIVATE_PCT%)
         if (not trail_active) and pnl_pct_now >= TRAIL_ACTIVATE_PCT:
             trail_active = True
             send_telegram(f"🛡️ 트레일 활성화: {t} peak={highest:.4f} | line {TRAIL_PCT:.2f}%")
@@ -633,7 +682,6 @@ def manage_positions_once():
         trail_line = highest*(1 - TRAIL_PCT/100.0) if trail_active else sl_price
         dyn_sl = max(sl_price, trail_line) if trail_active else sl_price
 
-        # 1) 동적SL 터치 (전량)
         if price <= dyn_sl and pnl_pct_now < TP_PCT:
             sr = safe_sell_market(UPBIT, t, 1.0)
             if sr.get("status") in ("OK","DUST_CLEAN"):
@@ -647,7 +695,7 @@ def manage_positions_once():
                     tg_trailing(t, avg_sell, qty, pnl_pct)
                 append_csv({"ts": now_str(),"ticker": t,"side":"STOP/TRAIL","qty": qty,"price": avg_sell,
                             "krw": qty*avg_sell,"fee": qty*avg_sell*FEE_RATE,"pnl_krw": qty*(avg_sell-avg),"pnl_pct": pnl_pct,
-                            "note": "dyn_sl"})
+                            "note":"dyn_sl"})
                 with POS_LOCK:
                     POS[t]["qty"] = 0.0
                     POS[t]["cooldown_until"] = time.time() + cd_min*60
@@ -656,7 +704,6 @@ def manage_positions_once():
                 tg_cooldown(t, end_reason, cd_min)
             continue
 
-        # 2) 부분익절 50% (1회)
         if (not partial_done) and (pnl_pct_now >= TP_PCT):
             sr = safe_sell_market(UPBIT, t, PARTIAL_TP_RATIO)
             if sr.get("status") == "OK":
@@ -676,7 +723,6 @@ def manage_positions_once():
                 save_pos()
                 continue
 
-        # 3) 트레일 라인 터치로 잔량 전량 청산
         if trail_active and price <= (highest*(1 - TRAIL_PCT/100.0)):
             sr = safe_sell_market(UPBIT, t, 1.0)
             if sr.get("status") in ("OK","DUST_CLEAN"):
@@ -694,7 +740,6 @@ def manage_positions_once():
                 tg_cooldown(t, "트레일링", 30 if partial_done else 90)
                 continue
 
-        # 상태 갱신(메모리)
         with POS_LOCK:
             POS[t]["highest"] = highest
             POS[t]["trail_active"] = trail_active
@@ -833,7 +878,6 @@ def manager_loop():
 def init_bot():
     if not ACCESS_KEY or not SECRET_KEY:
         raise RuntimeError("ACCESS_KEY/SECRET_KEY not set")
-    # 간단 진단: 권한/허용IP/레이트리밋
     try:
         payload = {'access_key': ACCESS_KEY, 'nonce': str(uuid.uuid4())}
         token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
