@@ -1,11 +1,15 @@
-# main.py — Upbit Bottom-Entry Bot (Cash-Only Budget + Reserved Pool + SafeOrders + Exact PnL + Trail Alerts)
-# 2025-08 final (with selectable fixed-entry mode)
+# main.py — Upbit Bottom-Entry Bot (percent_base 50% entry + Reserved Pool + SafeOrders + Exact PnL + Trail Alerts)
+# 2025-08 final
 # - 스캐너: TOPN 상위 유니버스 + 바닥반등(완화) 조건
-# - 예산: [기본] "현금"×(1-버퍼)만 사용, 슬롯 균등. under-min은 RESERVED_POOL에 누적 후 합산 집행
-#         [고정] ENTRY_MODE=fixed, BASE_BUDGET_KRW×ENTRY_RATIO 만큼 "항상 같은 금액"으로 진입(예: 90,000×0.5=45,000원)
+# - 예산:
+#   [기본] ENTRY_MODE=percent_base → 관측된 "현금 최대치"를 기준예산으로 삼아 항상 기준예산의 ENTRY_RATIO(기본 50%)만큼 진입
+#         (돈을 더 넣으면 다음부터 자동으로 진입금액이 커짐 / 남은 현금 기준으로 줄어드는 문제 방지)
+#   [옵션] ENTRY_MODE=fixed → BASE_BUDGET_KRW×ENTRY_RATIO 고정 금액 진입
+#   [옵션] ENTRY_MODE=per_slot → 현금×(1-버퍼) 균등 분할(기존 방식)
+#   under-min은 RESERVED_POOL에 누적 후 다음 진입에 합산 사용
 # - 매도: 손절 -1.2% → 부분익절 50%@+2.5%(1회) → 트레일링(최고가-1.5%) / 비상 하드스톱 -2.5% / 프리-스톱 -0.9%
-# - 체결가 기반 PnL: 매수/매도 모두 실체결가로 손익 계산/로그
-# - 트레일링: 활성화 알림 1회 보장(trail_alerted), highest 선 갱신
+# - 체결가 기반 PnL: 매수/매도 모두 실체결가로 손익 계산/CSV 기록
+# - 트레일링: 활성화 알림 1회 보장, highest 선 지속 갱신
 # - Dust: 평가금액 < DUST_LIMIT_KRW는 청소/숨김
 # - 09:00:15 KST 일일 리포트 + Dust 청소
 # - Render/Gunicorn 호환: import-time autostart
@@ -68,10 +72,10 @@ MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5000"))
 FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))
 DUST_LIMIT_KRW         = float(os.getenv("DUST_LIMIT_KRW", "2000"))
 
-# [고정 매수 모드] 선택 가능
-ENTRY_MODE             = os.getenv("ENTRY_MODE", "per_slot").lower()  # per_slot | fixed
-BASE_BUDGET_KRW        = float(os.getenv("BASE_BUDGET_KRW", "0"))     # 예: 90000
-ENTRY_RATIO            = float(os.getenv("ENTRY_RATIO", "0.5"))       # 예: 0.5 → 50%
+# 엔트리 모드
+ENTRY_MODE             = os.getenv("ENTRY_MODE", "percent_base").lower()  # percent_base | fixed | per_slot
+ENTRY_RATIO            = float(os.getenv("ENTRY_RATIO", "0.5"))           # 기본 50%
+BASE_BUDGET_KRW        = float(os.getenv("BASE_BUDGET_KRW", "0"))         # fixed 모드용
 
 # 스캐너
 SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))
@@ -107,6 +111,7 @@ PERSIST_DIR            = os.getenv("PERSIST_DIR", "./")
 os.makedirs(PERSIST_DIR, exist_ok=True)
 CSV_FILE               = os.path.join(PERSIST_DIR, "trades.csv")
 POS_FILE               = os.path.join(PERSIST_DIR, "pos.json")
+BUDGET_FILE            = os.path.join(PERSIST_DIR, "budget.json")
 
 # ===================== Globals =====================
 KST = timezone(timedelta(hours=9))
@@ -268,7 +273,7 @@ def safe_sell_market(market: str, portion: float = 1.0):
         est_all = bal_before*price_now
         if est_all < DUST_LIMIT_KRW:
             try:
-                _rate_gate(sym); resp = UPBIT.sell_market_order(market, bal_before)
+                _rate_gate(sym); _ = UPBIT.sell_market_order(market, bal_before)
                 _last_order_at[sym] = time.time()
             except Exception:
                 return {"status":"DUST_SKIP"}
@@ -304,14 +309,14 @@ def safe_sell_market(market: str, portion: float = 1.0):
     avg_sell = (received/filled) if filled>0 else (get_price_safe(market) or price_now)
     return {"status":"OK","filled":filled,"received":received,"avg_sell":avg_sell}
 
-# ===================== Indicators (no pandas dependency) =====================
+# ===================== Indicators =====================
 def ema_last(values, span):
     if not values: return 0.0
     alpha = 2.0/(span+1.0)
-    ema = values[0]
+    ema_val = values[0]
     for v in values[1:]:
-        ema = alpha*v + (1-alpha)*ema
-    return float(ema)
+        ema_val = alpha*v + (1-alpha)*ema_val
+    return float(ema_val)
 
 def rsi_last(values, period=14):
     if len(values) < period+1: return 50.0
@@ -358,10 +363,36 @@ def _summary(cand_cnt, slots_left, per_slot, stats=None):
     global _last_summary_ts
     if time.time() - _last_summary_ts < 600: return
     _last_summary_ts = time.time()
-    base = f"🔎 스캔요약: 후보 {cand_cnt} / TOPN={BACKOFF['topn']} / slots_left={slots_left} / per_slot≈₩{per_slot:,.0f}"
+    base = f"🔎 스캔요약: 후보 {cand_cnt} / TOPN={BACKOFF['topn']} / slots_left={slots_left} / per_entry≈₩{per_slot:,.0f}"
     if stats:
         base += f"\nscan={stats['scanned']} | ok={stats['ok']} | fail rsi={stats['rsi_fail']}, ema={stats['ema_fail']}, rebound={stats['rebound_fail']}, vol={stats['vol_fail']}"
     send_telegram(base)
+
+# ---- budget helpers for percent_base ----
+def _load_base_budget() -> float:
+    try:
+        if os.path.exists(BUDGET_FILE):
+            with open(BUDGET_FILE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+                return float(j.get("base_budget", 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+def _save_base_budget(v: float):
+    try:
+        with open(BUDGET_FILE, "w", encoding="utf-8") as f:
+            json.dump({"base_budget": float(v)}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _ensure_base_budget(current_cash: float) -> float:
+    # 관측된 '현금' 최대치를 기준예산으로 사용 (현금만 사용 전략 유지)
+    base = _load_base_budget()
+    if current_cash > base:
+        base = current_cash
+        _save_base_budget(base)
+    return base
 
 def scan_once_and_maybe_buy():
     global RESERVED_POOL
@@ -433,90 +464,51 @@ def scan_once_and_maybe_buy():
             cands.append((t, score, last, it["turnover24h"])); stats["ok"] += 1
         time.sleep(0.03+0.02*random.random())
 
-
-# ===== 예산 계산 (percent_base: 총금액의 50% 진입, 자동 기준예산 갱신) =====
-ENTRY_MODE       = os.getenv("ENTRY_MODE", "percent_base").lower()  # 기본: percent_base
-ENTRY_RATIO      = float(os.getenv("ENTRY_RATIO", "0.5"))           # 기본: 0.5 (50%)
-BUDGET_FILE      = os.path.join(PERSIST_DIR, "budget.json")
-
-def _load_base_budget() -> float:
-    try:
-        if os.path.exists(BUDGET_FILE):
-            with open(BUDGET_FILE, "r", encoding="utf-8") as f:
-                j = json.load(f)
-                return float(j.get("base_budget", 0.0))
-    except Exception:
-        pass
-    return 0.0
-
-def _save_base_budget(v: float):
-    try:
-        with open(BUDGET_FILE, "w", encoding="utf-8") as f:
-            json.dump({"base_budget": float(v)}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def _ensure_base_budget(current_cash: float) -> float:
-    # 관측된 ‘현금’ 최대치를 기준예산으로 사용 (현금만 사용 전략 유지)
-    base = _load_base_budget()
-    if current_cash > base:
-        base = current_cash
-        _save_base_budget(base)
-    return base
-
-# ---- 기존 scan_once_and_maybe_buy() 내부에서 이 블록으로 교체 ----
-krw_cash = get_balance_krw()
-usable = krw_cash * (1.0 - CASH_BUFFER_PCT) + RESERVED_POOL
-if usable < MIN_ORDER_KRW:
-    RESERVED_POOL = max(0.0, usable)
-    _summary(len(cands), slots_left, 0.0, stats)
-    return
-
-if ENTRY_MODE == "percent_base":
-    # ① 기준예산을 최신 현금 최대치로 자동 갱신
-    base_budget = _ensure_base_budget(krw_cash + RESERVED_POOL)
-    # ② 진입금액 = 기준예산 × 비율(기본 50%)
-    per_entry = max(MIN_ORDER_KRW, base_budget * ENTRY_RATIO)
-    # ③ 실제 사용 가능 현금을 넘지 않도록 캡
-    per_entry = min(per_entry, usable)
-
-    # 슬롯 수는 ‘사용 가능 금액/진입금액’으로 제한
-    slots_to_use = min(slots_left, int(usable // per_entry)) or 0
-    if slots_to_use <= 0:
-        RESERVED_POOL = usable
+    # ===== 예산 계산 =====
+    krw_cash = get_balance_krw()
+    usable = krw_cash * (1.0 - CASH_BUFFER_PCT) + RESERVED_POOL
+    if usable < MIN_ORDER_KRW:
+        RESERVED_POOL = max(0.0, usable)
         _summary(len(cands), slots_left, 0.0, stats)
         return
-    per_slot = per_entry
 
-elif ENTRY_MODE == "fixed":
-    # (이전 고정모드 유지용) BASE_BUDGET_KRW×ENTRY_RATIO 고정
-    BASE_BUDGET_KRW = float(os.getenv("BASE_BUDGET_KRW", "0"))
-    per_entry = max(MIN_ORDER_KRW, BASE_BUDGET_KRW * ENTRY_RATIO)
-    per_entry = min(per_entry, usable)
-    slots_to_use = min(slots_left, int(usable // per_entry)) or 0
-    if slots_to_use <= 0:
-        RESERVED_POOL = usable
-        _summary(len(cands), slots_left, 0.0, stats)
-        return
-    per_slot = per_entry
-
-else:
-    # 기존 per_slot 균등 배분 모드
-    per_slot = usable/slots_left if slots_left>0 else 0.0
-    if per_slot < MIN_ORDER_KRW:
-        slots_to_use = 1
-        per_slot = usable
-    else:
-        slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW)) or 0
-        if slots_to_use == 0:
+    if ENTRY_MODE == "percent_base":
+        # 기준예산 = 관측된 '현금 최대치'(KRW + RESERVED_POOL)
+        base_budget = _ensure_base_budget(krw_cash + RESERVED_POOL)
+        per_entry = max(MIN_ORDER_KRW, base_budget * ENTRY_RATIO)
+        per_entry = min(per_entry, usable)
+        slots_to_use = min(slots_left, int(usable // per_entry))
+        if slots_to_use <= 0:
             RESERVED_POOL = usable
             _summary(len(cands), slots_left, 0.0, stats)
             return
+        per_slot = per_entry
 
-_summary(len(cands), slots_to_use, per_slot, stats)
+    elif ENTRY_MODE == "fixed":
+        per_entry = max(MIN_ORDER_KRW, BASE_BUDGET_KRW * ENTRY_RATIO)
+        per_entry = min(per_entry, usable)
+        slots_to_use = min(slots_left, int(usable // per_entry))
+        if slots_to_use <= 0:
+            RESERVED_POOL = usable
+            _summary(len(cands), slots_left, 0.0, stats)
+            return
+        per_slot = per_entry
 
+    else:  # per_slot
+        per_slot = usable/slots_left if slots_left>0 else 0.0
+        if per_slot < MIN_ORDER_KRW:
+            slots_to_use = 1
+            per_slot = usable
+        else:
+            slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW))
+            if slots_to_use == 0:
+                RESERVED_POOL = usable
+                _summary(len(cands), slots_left, 0.0, stats)
+                return
 
-        if not cands:
+    _summary(len(cands), slots_to_use, per_slot, stats)
+
+    if not cands:
         RESERVED_POOL = usable
         return
 
@@ -544,7 +536,7 @@ _summary(len(cands), slots_to_use, per_slot, stats)
                 f"— 수량: {qty:.6f}\n"
                 f"— 체결가: ₩{avg:,.4f}\n"
                 f"— 투자금액: ₩{spent:,.0f}\n"
-                f"— 기준: " + ("고정 예산" if ENTRY_MODE=="fixed" else "현금×(1-버퍼) 슬릇균등")
+                f"— 기준: " + ("총금액 50% (percent_base)" if ENTRY_MODE=="percent_base" else ("고정 예산" if ENTRY_MODE=="fixed" else "현금×(1-버퍼) 균등"))
             )
             append_csv({"ts": now_str(),"ticker": t,"side":"BUY","qty": qty,"price": avg,
                         "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"bottom_entry"})
