@@ -1,10 +1,11 @@
 # main.py — Upbit Bottom-Entry Bot (Cash-Only Budget + Reserved Pool + SafeOrders + Exact PnL + Trail Alerts)
-# 2025-08 final
+# 2025-08 final (with selectable fixed-entry mode)
 # - 스캐너: TOPN 상위 유니버스 + 바닥반등(완화) 조건
-# - 예산: "현금"×(1-버퍼)만 사용, 슬롯 균등. 최소주문 미만이면 자동 합산하여 1건으로 집행 + 잔액은 RESERVED_POOL로 이월
+# - 예산: [기본] "현금"×(1-버퍼)만 사용, 슬롯 균등. under-min은 RESERVED_POOL에 누적 후 합산 집행
+#         [고정] ENTRY_MODE=fixed, BASE_BUDGET_KRW×ENTRY_RATIO 만큼 "항상 같은 금액"으로 진입(예: 90,000×0.5=45,000원)
 # - 매도: 손절 -1.2% → 부분익절 50%@+2.5%(1회) → 트레일링(최고가-1.5%) / 비상 하드스톱 -2.5% / 프리-스톱 -0.9%
 # - 체결가 기반 PnL: 매수/매도 모두 실체결가로 손익 계산/로그
-# - 트레일링: 활성화 알림 1회 보장(trail_alerted 플래그), highest 선 갱신
+# - 트레일링: 활성화 알림 1회 보장(trail_alerted), highest 선 갱신
 # - Dust: 평가금액 < DUST_LIMIT_KRW는 청소/숨김
 # - 09:00:15 KST 일일 리포트 + Dust 청소
 # - Render/Gunicorn 호환: import-time autostart
@@ -66,6 +67,11 @@ MAX_OPEN_POSITIONS     = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
 MIN_ORDER_KRW          = float(os.getenv("MIN_ORDER_KRW", "5000"))
 FEE_RATE               = float(os.getenv("FEE_RATE", "0.0005"))
 DUST_LIMIT_KRW         = float(os.getenv("DUST_LIMIT_KRW", "2000"))
+
+# [고정 매수 모드] 선택 가능
+ENTRY_MODE             = os.getenv("ENTRY_MODE", "per_slot").lower()  # per_slot | fixed
+BASE_BUDGET_KRW        = float(os.getenv("BASE_BUDGET_KRW", "0"))     # 예: 90000
+ENTRY_RATIO            = float(os.getenv("ENTRY_RATIO", "0.5"))       # 예: 0.5 → 50%
 
 # 스캐너
 SCAN_INTERVAL_SEC      = int(os.getenv("SCAN_INTERVAL_SEC", "45"))
@@ -264,7 +270,6 @@ def safe_sell_market(market: str, portion: float = 1.0):
             try:
                 _rate_gate(sym); resp = UPBIT.sell_market_order(market, bal_before)
                 _last_order_at[sym] = time.time()
-                # 아래에서 fill 계산
             except Exception:
                 return {"status":"DUST_SKIP"}
         else:
@@ -282,13 +287,12 @@ def safe_sell_market(market: str, portion: float = 1.0):
 
     # fill 측정 (정확한 avg_sell)
     krw_b = get_balance_krw()
-    bal_mid = get_balance_coin(sym)  # 호출 타이밍 보정용
     time.sleep(0.6)
     krw_a = get_balance_krw()
     bal_a = get_balance_coin(sym)
     filled = max(0.0, bal_before - bal_a)
     received = max(0.0, krw_a - krw_b)
-    if filled <= 0:  # 체결 대기 루프
+    if filled <= 0:
         t0 = time.time()
         while time.time()-t0 < 30:
             bal_a = get_balance_coin(sym)
@@ -300,19 +304,29 @@ def safe_sell_market(market: str, portion: float = 1.0):
     avg_sell = (received/filled) if filled>0 else (get_price_safe(market) or price_now)
     return {"status":"OK","filled":filled,"received":received,"avg_sell":avg_sell}
 
-# ===================== Indicators =====================
-def ema(series, span):
-    import pandas as pd
-    return pd.Series(series).ewm(span=span, adjust=False).mean().tolist()
+# ===================== Indicators (no pandas dependency) =====================
+def ema_last(values, span):
+    if not values: return 0.0
+    alpha = 2.0/(span+1.0)
+    ema = values[0]
+    for v in values[1:]:
+        ema = alpha*v + (1-alpha)*ema
+    return float(ema)
 
-def rsi14(df):
-    import pandas as pd
-    d = df["close"].diff()
-    up = d.clip(lower=0); down = -d.clip(upper=0)
-    ru = up.ewm(span=14, adjust=False).mean()
-    rd = down.ewm(span=14, adjust=False).mean()
-    rs = ru/(rd+1e-12)
-    return (100 - (100/(1+rs))).tolist()
+def rsi_last(values, period=14):
+    if len(values) < period+1: return 50.0
+    gains = []; losses = []
+    for i in range(1, len(values)):
+        d = values[i]-values[i-1]
+        gains.append(max(d,0.0)); losses.append(max(-d,0.0))
+    avg_gain = sum(gains[:period])/period
+    avg_loss = sum(losses[:period])/period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1)+gains[i])/period
+        avg_loss = (avg_loss*(period-1)+losses[i])/period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain/avg_loss
+    return 100.0 - (100.0/(1.0+rs))
 
 # ===================== Scanner =====================
 TICKER_URL = "https://api.upbit.com/v1/ticker"
@@ -379,7 +393,6 @@ def scan_once_and_maybe_buy():
 
     topN = fetch_top_by_turnover(uni, BACKOFF["topn"])
     if not topN:
-        # 후보 없어도 RESERVED_POOL은 유지
         _summary(0, slots_left, 0.0)
         return
 
@@ -398,10 +411,10 @@ def scan_once_and_maybe_buy():
         vols   = df["volume"].tolist()
         stats["scanned"] += 1
 
-        rsi = rsi14(df); rsi_ok = (rsi[-1] if isinstance(rsi[-1], (int,float)) else 50.0) <= RSI_MAX_BOTTOM
+        rsi_ok = (rsi_last(closes) <= RSI_MAX_BOTTOM)
         if not rsi_ok: stats["rsi_fail"] += 1
 
-        ema10 = ema(closes, 10)[-1]; ema20 = ema(closes, 20)[-1]
+        ema10 = ema_last(closes, 10); ema20 = ema_last(closes, 20)
         last = closes[-1]
         ema_ok = (abs(last-ema10)/max(1e-9, ema10) <= EMA_NEAR_PCT/100.0) or \
                  (abs(last-ema20)/max(1e-9, ema20) <= EMA_NEAR_PCT/100.0)
@@ -416,12 +429,11 @@ def scan_once_and_maybe_buy():
         if not vol_ok: stats["vol_fail"] += 1
 
         if rsi_ok and ema_ok and rebound_ok and vol_ok:
-            score = (50-(rsi[-1] if isinstance(rsi[-1], (int,float)) else 50)) + (vols[-1]/(v10+1e-9)) + (last/recent_low)
-            cands.append((t, score, last, it["turnover24h"]))
-            stats["ok"] += 1
+            score = (50-rsi_last(closes)) + (vols[-1]/(v10+1e-9)) + (last/recent_low)
+            cands.append((t, score, last, it["turnover24h"])); stats["ok"] += 1
         time.sleep(0.03+0.02*random.random())
 
-    # ===== 현금만 기준 + under-min 누적 풀 =====
+    # ===== 예산 계산 =====
     krw_cash = get_balance_krw()
     usable = krw_cash * (1.0 - CASH_BUFFER_PCT) + RESERVED_POOL
 
@@ -430,21 +442,29 @@ def scan_once_and_maybe_buy():
         _summary(len(cands), slots_left, 0.0, stats)
         return
 
-    per_slot = usable/slots_left if slots_left>0 else 0.0
-    if per_slot < MIN_ORDER_KRW:
-        slots_to_use = 1
-        per_slot = usable  # 한 번에 몰아 매수
-    else:
-        slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW))
-        if slots_to_use == 0:
+    if ENTRY_MODE == "fixed" and BASE_BUDGET_KRW > 0:
+        per_entry = max(MIN_ORDER_KRW, BASE_BUDGET_KRW * ENTRY_RATIO)
+        slots_to_use = min(slots_left, int(usable // per_entry))
+        if slots_to_use <= 0:
             RESERVED_POOL = usable
             _summary(len(cands), slots_left, 0.0, stats)
             return
+        per_slot = per_entry
+    else:
+        per_slot = usable/slots_left if slots_left>0 else 0.0
+        if per_slot < MIN_ORDER_KRW:
+            slots_to_use = 1
+            per_slot = usable  # 한 번에 몰아 매수
+        else:
+            slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW))
+            if slots_to_use == 0:
+                RESERVED_POOL = usable
+                _summary(len(cands), slots_left, 0.0, stats)
+                return
 
     _summary(len(cands), slots_to_use, per_slot, stats)
 
     if not cands:
-        # 후보 없으면 usable을 풀에 적립하여 다음 스캔에 합산 사용
         RESERVED_POOL = usable
         return
 
@@ -472,10 +492,10 @@ def scan_once_and_maybe_buy():
                 f"— 수량: {qty:.6f}\n"
                 f"— 체결가: ₩{avg:,.4f}\n"
                 f"— 투자금액: ₩{spent:,.0f}\n"
-                f"— 기준: 현금×(1-버퍼) 합산/슬롯 = ₩{per_slot:,.0f}"
+                f"— 기준: " + ("고정 예산" if ENTRY_MODE=="fixed" else "현금×(1-버퍼) 슬릇균등")
             )
             append_csv({"ts": now_str(),"ticker": t,"side":"BUY","qty": qty,"price": avg,
-                        "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"bottom_entry(cash_only+pool)"})
+                        "krw": -spent,"fee": spent*FEE_RATE,"pnl_krw":0,"pnl_pct":0,"note":"bottom_entry"})
 
     RESERVED_POOL = max(0.0, usable - spent_total)
 
@@ -729,7 +749,6 @@ def manager_loop():
         try: manage_positions_once()
         except Exception:
             print(f"[manager] {traceback.format_exc()}")
-        # 환경변수로 150ms 권장 (Render Settings → MANAGER_TICK_MS=150)
         time.sleep(max(0.1, float(os.getenv("MANAGER_TICK_MS","150"))/1000.0))
 
 # ===================== Boot =====================
