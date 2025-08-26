@@ -433,38 +433,90 @@ def scan_once_and_maybe_buy():
             cands.append((t, score, last, it["turnover24h"])); stats["ok"] += 1
         time.sleep(0.03+0.02*random.random())
 
-    # ===== 예산 계산 =====
-    krw_cash = get_balance_krw()
-    usable = krw_cash * (1.0 - CASH_BUFFER_PCT) + RESERVED_POOL
 
-    if usable < MIN_ORDER_KRW:
-        RESERVED_POOL = max(0.0, usable)
+# ===== 예산 계산 (percent_base: 총금액의 50% 진입, 자동 기준예산 갱신) =====
+ENTRY_MODE       = os.getenv("ENTRY_MODE", "percent_base").lower()  # 기본: percent_base
+ENTRY_RATIO      = float(os.getenv("ENTRY_RATIO", "0.5"))           # 기본: 0.5 (50%)
+BUDGET_FILE      = os.path.join(PERSIST_DIR, "budget.json")
+
+def _load_base_budget() -> float:
+    try:
+        if os.path.exists(BUDGET_FILE):
+            with open(BUDGET_FILE, "r", encoding="utf-8") as f:
+                j = json.load(f)
+                return float(j.get("base_budget", 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+def _save_base_budget(v: float):
+    try:
+        with open(BUDGET_FILE, "w", encoding="utf-8") as f:
+            json.dump({"base_budget": float(v)}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _ensure_base_budget(current_cash: float) -> float:
+    # 관측된 ‘현금’ 최대치를 기준예산으로 사용 (현금만 사용 전략 유지)
+    base = _load_base_budget()
+    if current_cash > base:
+        base = current_cash
+        _save_base_budget(base)
+    return base
+
+# ---- 기존 scan_once_and_maybe_buy() 내부에서 이 블록으로 교체 ----
+krw_cash = get_balance_krw()
+usable = krw_cash * (1.0 - CASH_BUFFER_PCT) + RESERVED_POOL
+if usable < MIN_ORDER_KRW:
+    RESERVED_POOL = max(0.0, usable)
+    _summary(len(cands), slots_left, 0.0, stats)
+    return
+
+if ENTRY_MODE == "percent_base":
+    # ① 기준예산을 최신 현금 최대치로 자동 갱신
+    base_budget = _ensure_base_budget(krw_cash + RESERVED_POOL)
+    # ② 진입금액 = 기준예산 × 비율(기본 50%)
+    per_entry = max(MIN_ORDER_KRW, base_budget * ENTRY_RATIO)
+    # ③ 실제 사용 가능 현금을 넘지 않도록 캡
+    per_entry = min(per_entry, usable)
+
+    # 슬롯 수는 ‘사용 가능 금액/진입금액’으로 제한
+    slots_to_use = min(slots_left, int(usable // per_entry)) or 0
+    if slots_to_use <= 0:
+        RESERVED_POOL = usable
         _summary(len(cands), slots_left, 0.0, stats)
         return
+    per_slot = per_entry
 
-    if ENTRY_MODE == "fixed" and BASE_BUDGET_KRW > 0:
-        per_entry = max(MIN_ORDER_KRW, BASE_BUDGET_KRW * ENTRY_RATIO)
-        slots_to_use = min(slots_left, int(usable // per_entry))
-        if slots_to_use <= 0:
+elif ENTRY_MODE == "fixed":
+    # (이전 고정모드 유지용) BASE_BUDGET_KRW×ENTRY_RATIO 고정
+    BASE_BUDGET_KRW = float(os.getenv("BASE_BUDGET_KRW", "0"))
+    per_entry = max(MIN_ORDER_KRW, BASE_BUDGET_KRW * ENTRY_RATIO)
+    per_entry = min(per_entry, usable)
+    slots_to_use = min(slots_left, int(usable // per_entry)) or 0
+    if slots_to_use <= 0:
+        RESERVED_POOL = usable
+        _summary(len(cands), slots_left, 0.0, stats)
+        return
+    per_slot = per_entry
+
+else:
+    # 기존 per_slot 균등 배분 모드
+    per_slot = usable/slots_left if slots_left>0 else 0.0
+    if per_slot < MIN_ORDER_KRW:
+        slots_to_use = 1
+        per_slot = usable
+    else:
+        slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW)) or 0
+        if slots_to_use == 0:
             RESERVED_POOL = usable
             _summary(len(cands), slots_left, 0.0, stats)
             return
-        per_slot = per_entry
-    else:
-        per_slot = usable/slots_left if slots_left>0 else 0.0
-        if per_slot < MIN_ORDER_KRW:
-            slots_to_use = 1
-            per_slot = usable  # 한 번에 몰아 매수
-        else:
-            slots_to_use = min(slots_left, int(usable // MIN_ORDER_KRW))
-            if slots_to_use == 0:
-                RESERVED_POOL = usable
-                _summary(len(cands), slots_left, 0.0, stats)
-                return
 
-    _summary(len(cands), slots_to_use, per_slot, stats)
+_summary(len(cands), slots_to_use, per_slot, stats)
 
-    if not cands:
+
+        if not cands:
         RESERVED_POOL = usable
         return
 
